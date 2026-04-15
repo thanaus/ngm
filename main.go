@@ -9,15 +9,23 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"runtime/pprof"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/linkedin/goavro/v2"
 	"github.com/spf13/cobra"
 )
 
 var osSep = string([]byte{os.PathSeparator})
+
+const (
+	objectKindDir   = "dir"
+	objectKindFile  = "file"
+	objectKindOther = "other"
+)
 
 type ScanResult struct {
 	TotalFiles  int64
@@ -30,6 +38,18 @@ type ScanResult struct {
 	ScanNs    int64
 	ReadDirNs int64
 	InfoNs    int64
+}
+
+type ObjectRecord struct {
+	Path string
+	Kind string
+	Size int64
+}
+
+type avroExport struct {
+	path string
+	rows chan ObjectRecord
+	errc chan error
 }
 
 type dirQueue struct {
@@ -88,6 +108,8 @@ func main() {
 		noSize     bool
 		batch      int
 		cpuProfile string
+		memProfile string
+		avroDir    string
 	)
 
 	rootCmd := &cobra.Command{
@@ -105,8 +127,7 @@ and reports the number of files, directories, total size, and performance metric
 				return fmt.Errorf("--batch must be >= 1")
 			}
 			root := filepath.Clean(args[0])
-			run(root, workers, noSize, batch, cpuProfile)
-			return nil
+			return run(root, workers, noSize, batch, cpuProfile, memProfile, avroDir)
 		},
 	}
 
@@ -114,28 +135,32 @@ and reports the number of files, directories, total size, and performance metric
 	rootCmd.Flags().BoolVarP(&noSize,       "no-size",    "s", false, "Skip file size collection (avoids one lstat per file)")
 	rootCmd.Flags().IntVarP(&batch,         "batch",      "b", 256,   "Number of entries read per ReadDir syscall (getdents64 batch size)")
 	rootCmd.Flags().StringVarP(&cpuProfile, "cpuprofile", "p", "",    "Write CPU profile to this file (analyse with: go tool pprof -top <file>)")
+	rootCmd.Flags().StringVar(&memProfile,  "memprofile", "",         "Write heap profile to this file (analyse with: go tool pprof -top <binary> <file>)")
+	rootCmd.Flags().StringVar(&avroDir,     "avro-dir", "",           "Write scanned objects to an avro file in this directory")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
 }
 
-func run(root string, workers int, noSize bool, batch int, cpuProfile string) {
+func run(root string, workers int, noSize bool, batch int, cpuProfile, memProfile, avroDir string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
 	if cpuProfile != "" {
 		f, err := os.Create(cpuProfile)
 		if err != nil {
-			log.Fatalf("could not create CPU profile: %v", err)
+			return fmt.Errorf("could not create CPU profile: %w", err)
 		}
 		if err := pprof.StartCPUProfile(f); err != nil {
 			f.Close()
-			log.Fatalf("could not start CPU profile: %v", err)
+			return fmt.Errorf("could not start CPU profile: %w", err)
 		}
 		defer func() {
 			pprof.StopCPUProfile()
-			f.Close()
+			if err := f.Close(); err != nil {
+				log.Printf("[error] close CPU profile %q: %v", cpuProfile, err)
+			}
 		}()
 	}
 
@@ -144,6 +169,19 @@ func run(root string, workers int, noSize bool, batch int, cpuProfile string) {
 	q := newDirQueue(root)
 	var result ScanResult
 	var wg, reporterWg sync.WaitGroup
+	var exportRows chan ObjectRecord
+	var exportPath string
+	var exportLabel string
+
+	avroExporter, err := startAvroExport(avroDir, workers, batch)
+	if err != nil {
+		return err
+	}
+	if avroExporter != nil {
+		exportRows = avroExporter.rows
+		exportPath = avroExporter.path
+		exportLabel = "Avro"
+	}
 
 	reporterWg.Add(1)
 	go func() {
@@ -155,16 +193,25 @@ func run(root string, workers int, noSize bool, batch int, cpuProfile string) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runWorker(ctx, q, &result, noSize, batch)
+			runWorker(ctx, q, &result, noSize, batch, exportRows)
 		}()
 	}
 
 	wg.Wait()
 
 	interrupted := ctx.Err() != nil
+	if avroExporter != nil {
+		close(avroExporter.rows)
+	}
 
 	cancel()
 	reporterWg.Wait()
+
+	if avroExporter != nil {
+		if err := avroExporter.wait(); err != nil {
+			return err
+		}
+	}
 
 	elapsed := time.Since(start)
 	dirs  := atomic.LoadInt64(&result.TotalDirs)
@@ -185,6 +232,9 @@ func run(root string, workers int, noSize bool, batch int, cpuProfile string) {
 	)
 	fmt.Printf("%-12s%d\n", "Errors", atomic.LoadInt64(&result.TotalErrors))
 	fmt.Printf("%-12s%s\n\n", "Size", humanBytes(atomic.LoadInt64(&result.TotalBytes)))
+	if exportPath != "" {
+		fmt.Printf("%-12s%s\n\n", exportLabel, exportPath)
+	}
 
 	totalWorkerNs := float64(workers) * float64(elapsed.Nanoseconds())
 	idleNs        := float64(atomic.LoadInt64(&result.IdleNs))
@@ -200,6 +250,33 @@ func run(root string, workers int, noSize bool, batch int, cpuProfile string) {
 		fmt.Printf("  %-10s%.1f%%\n", "readdir", 100*readDirNs/scanNs)
 		fmt.Printf("  %-10s%.1f%%\n", "lstat", 100*infoNs/scanNs)
 	}
+	if err := writeHeapProfile(memProfile); err != nil {
+		return err
+	}
+	return nil
+}
+
+func writeHeapProfile(path string) error {
+	if path == "" {
+		return nil
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("could not create memory profile: %w", err)
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			log.Printf("[error] close memory profile %q: %v", path, closeErr)
+		}
+	}()
+
+	// Force a GC so the heap profile reflects live memory.
+	runtime.GC()
+	if err := pprof.WriteHeapProfile(f); err != nil {
+		return fmt.Errorf("could not write memory profile: %w", err)
+	}
+	return nil
 }
 
 func reportProgress(ctx context.Context, result *ScanResult, start time.Time, noSize bool) {
@@ -241,7 +318,7 @@ func reportProgress(ctx context.Context, result *ScanResult, start time.Time, no
 	}
 }
 
-func runWorker(ctx context.Context, q *dirQueue, result *ScanResult, noSize bool, batch int) {
+func runWorker(ctx context.Context, q *dirQueue, result *ScanResult, noSize bool, batch int, exportRows chan<- ObjectRecord) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -256,7 +333,7 @@ func runWorker(ctx context.Context, q *dirQueue, result *ScanResult, noSize bool
 		}
 
 		t1 := time.Now()
-		subdirs := scanDir(ctx, dir, result, noSize, batch)
+		subdirs := scanDir(ctx, dir, result, noSize, batch, exportRows)
 		atomic.AddInt64(&result.ScanNs, int64(time.Since(t1)))
 
 		q.push(subdirs)
@@ -264,7 +341,7 @@ func runWorker(ctx context.Context, q *dirQueue, result *ScanResult, noSize bool
 	}
 }
 
-func scanDir(ctx context.Context, dir string, result *ScanResult, noSize bool, batch int) []string {
+func scanDir(ctx context.Context, dir string, result *ScanResult, noSize bool, batch int, exportRows chan<- ObjectRecord) []string {
 	f, err := os.Open(dir)
 	if err != nil {
 		log.Printf("[error] open %q: %v", dir, err)
@@ -286,27 +363,39 @@ func scanDir(ctx context.Context, dir string, result *ScanResult, noSize bool, b
 		atomic.AddInt64(&result.ReadDirNs, int64(time.Since(t)))
 
 		for _, entry := range entries {
+			path := prefix + entry.Name()
 			switch {
 			case entry.IsDir():
 				atomic.AddInt64(&result.TotalDirs, 1)
-				subdirs = append(subdirs, prefix+entry.Name())
+				subdirs = append(subdirs, path)
+				if !emitRecord(ctx, exportRows, ObjectRecord{Path: path, Kind: objectKindDir}) {
+					return subdirs
+				}
 
 			case entry.Type().IsRegular():
 				atomic.AddInt64(&result.TotalFiles, 1)
+				record := ObjectRecord{Path: path, Kind: objectKindFile}
 				if !noSize {
 					t := time.Now()
 					info, infoErr := entry.Info()
 					atomic.AddInt64(&result.InfoNs, int64(time.Since(t)))
 					if infoErr != nil {
-						log.Printf("[error] info %q: %v", prefix+entry.Name(), infoErr)
+						log.Printf("[error] info %q: %v", path, infoErr)
 						atomic.AddInt64(&result.TotalErrors, 1)
-						continue
+					} else {
+						record.Size = info.Size()
+						atomic.AddInt64(&result.TotalBytes, record.Size)
 					}
-					atomic.AddInt64(&result.TotalBytes, info.Size())
+				}
+				if !emitRecord(ctx, exportRows, record) {
+					return subdirs
 				}
 
 			default:
 				atomic.AddInt64(&result.TotalOthers, 1)
+				if !emitRecord(ctx, exportRows, ObjectRecord{Path: path, Kind: objectKindOther}) {
+					return subdirs
+				}
 			}
 		}
 		if err != nil {
@@ -320,6 +409,117 @@ func scanDir(ctx context.Context, dir string, result *ScanResult, noSize bool, b
 
 	return subdirs
 }
+
+func emitRecord(ctx context.Context, exportRows chan<- ObjectRecord, record ObjectRecord) bool {
+	if exportRows == nil {
+		return true
+	}
+	select {
+	case exportRows <- record:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func startAvroExport(avroDir string, workers, batch int) (*avroExport, error) {
+	if avroDir == "" {
+		return nil, nil
+	}
+	if err := os.MkdirAll(avroDir, 0o755); err != nil {
+		return nil, fmt.Errorf("could not create avro directory %q: %w", avroDir, err)
+	}
+
+	path := filepath.Join(avroDir, fmt.Sprintf("scan-%s.avro", time.Now().Format("20060102-150405")))
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, fmt.Errorf("could not create avro file %q: %w", path, err)
+	}
+
+	exporter := &avroExport{
+		path: path,
+		rows: make(chan ObjectRecord, exportBufferSize(workers, batch)),
+		errc: make(chan error, 1),
+	}
+	go func() {
+		exporter.errc <- writeAvroFile(f, exporter.rows)
+	}()
+	return exporter, nil
+}
+
+func (e *avroExport) wait() error {
+	if e == nil {
+		return nil
+	}
+	return <-e.errc
+}
+
+func exportBufferSize(workers, batch int) int {
+	bufferSize := workers * batch
+	if bufferSize < 1024 {
+		bufferSize = 1024
+	}
+	return bufferSize
+}
+
+func writeAvroFile(f *os.File, rows <-chan ObjectRecord) (err error) {
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			closeErr = fmt.Errorf("could not close avro file %q: %w", f.Name(), closeErr)
+			if err == nil {
+				err = closeErr
+			} else {
+				err = errors.Join(err, closeErr)
+			}
+		}
+	}()
+
+	writer, err := goavro.NewOCFWriter(goavro.OCFConfig{
+		W:               f,
+		Schema:          avroObjectRecordSchema,
+		CompressionName: "deflate",
+	})
+	if err != nil {
+		return fmt.Errorf("could not initialize avro writer %q: %w", f.Name(), err)
+	}
+
+	batch := make([]interface{}, 0, 1024)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := writer.Append(batch); err != nil {
+			return fmt.Errorf("could not write avro rows to %q: %w", f.Name(), err)
+		}
+		batch = batch[:0]
+		return nil
+	}
+
+	for row := range rows {
+		batch = append(batch, map[string]interface{}{
+			"path": row.Path,
+			"kind": row.Kind,
+			"size": row.Size,
+		})
+		if len(batch) == cap(batch) {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
+
+	return flush()
+}
+
+const avroObjectRecordSchema = `{
+  "type": "record",
+  "name": "ObjectRecord",
+  "fields": [
+    {"name": "path", "type": "string"},
+    {"name": "kind", "type": "string"},
+    {"name": "size", "type": "long"}
+  ]
+}`
 
 func humanSI(n int64) string {
 	switch {
