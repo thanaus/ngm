@@ -447,12 +447,17 @@ func startAvroExport(avroDir string, workers, batch int) (*avroExport, error) {
 	if avroDir == "" {
 		return nil, nil
 	}
-	if err := os.MkdirAll(avroDir, 0o755); err != nil {
-		return nil, fmt.Errorf("could not create avro directory %q: %w", avroDir, err)
+	tmpDir := filepath.Join(avroDir, "tmp")
+	incomingDir := filepath.Join(avroDir, "incoming")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return nil, fmt.Errorf("could not create avro tmp directory %q: %w", tmpDir, err)
+	}
+	if err := os.MkdirAll(incomingDir, 0o755); err != nil {
+		return nil, fmt.Errorf("could not create avro incoming directory %q: %w", incomingDir, err)
 	}
 
 	baseName := fmt.Sprintf("scan-%s", time.Now().Format("20060102-150405"))
-	pathPattern := filepath.Join(avroDir, baseName+"-*.avro")
+	pathPattern := filepath.Join(incomingDir, baseName+"-*.avro")
 
 	exporter := &avroExport{
 		path: pathPattern,
@@ -460,7 +465,7 @@ func startAvroExport(avroDir string, workers, batch int) (*avroExport, error) {
 		errc: make(chan error, 1),
 	}
 	go func() {
-		exporter.errc <- writeAvroFiles(avroDir, baseName, exporter.rows)
+		exporter.errc <- writeAvroFiles(tmpDir, incomingDir, baseName, exporter.rows)
 	}()
 	return exporter, nil
 }
@@ -525,12 +530,14 @@ func ctimeUnixNs(info os.FileInfo) int64 {
 	return stat.Ctim.Sec*1_000_000_000 + stat.Ctim.Nsec
 }
 
-func writeAvroFiles(avroDir, baseName string, rows <-chan ObjectRecord) (err error) {
+func writeAvroFiles(tmpDir, incomingDir, baseName string, rows <-chan ObjectRecord) (err error) {
 	var (
-		f             *os.File
-		writer        *goavro.OCFWriter
-		fileIndex     int
-		recordsInFile int
+		f                  *os.File
+		writer             *goavro.OCFWriter
+		fileIndex          int
+		recordsInFile      int
+		currentTmpPath     string
+		currentIncomingPath string
 	)
 
 	closeCurrent := func() error {
@@ -541,10 +548,25 @@ func writeAvroFiles(avroDir, baseName string, rows <-chan ObjectRecord) (err err
 		name := f.Name()
 		f = nil
 		writer = nil
-		recordsInFile = 0
 		if closeErr != nil {
 			return fmt.Errorf("could not close avro file %q: %w", name, closeErr)
 		}
+		return nil
+	}
+
+	publishCurrent := func() error {
+		if f == nil {
+			return nil
+		}
+		if err := closeCurrent(); err != nil {
+			return err
+		}
+		if err := os.Rename(currentTmpPath, currentIncomingPath); err != nil {
+			return fmt.Errorf("could not move avro file %q to %q: %w", currentTmpPath, currentIncomingPath, err)
+		}
+		currentTmpPath = ""
+		currentIncomingPath = ""
+		recordsInFile = 0
 		return nil
 	}
 
@@ -563,10 +585,12 @@ func writeAvroFiles(avroDir, baseName string, rows <-chan ObjectRecord) (err err
 			return err
 		}
 		fileIndex++
-		path := filepath.Join(avroDir, fmt.Sprintf("%s-%06d.avro", baseName, fileIndex))
-		nextFile, err := os.Create(path)
+		recordsInFile = 0
+		currentTmpPath = filepath.Join(tmpDir, fmt.Sprintf("%s-%06d.avro", baseName, fileIndex))
+		currentIncomingPath = filepath.Join(incomingDir, fmt.Sprintf("%s-%06d.avro", baseName, fileIndex))
+		nextFile, err := os.Create(currentTmpPath)
 		if err != nil {
-			return fmt.Errorf("could not create avro file %q: %w", path, err)
+			return fmt.Errorf("could not create avro file %q: %w", currentTmpPath, err)
 		}
 		nextWriter, err := goavro.NewOCFWriter(goavro.OCFConfig{
 			W:               nextFile,
@@ -577,11 +601,11 @@ func writeAvroFiles(avroDir, baseName string, rows <-chan ObjectRecord) (err err
 			closeErr := nextFile.Close()
 			if closeErr != nil {
 				return errors.Join(
-					fmt.Errorf("could not initialize avro writer %q: %w", path, err),
-					fmt.Errorf("could not close avro file %q: %w", path, closeErr),
+					fmt.Errorf("could not initialize avro writer %q: %w", currentTmpPath, err),
+					fmt.Errorf("could not close avro file %q: %w", currentTmpPath, closeErr),
 				)
 			}
-			return fmt.Errorf("could not initialize avro writer %q: %w", path, err)
+			return fmt.Errorf("could not initialize avro writer %q: %w", currentTmpPath, err)
 		}
 		f = nextFile
 		writer = nextWriter
@@ -600,6 +624,9 @@ func writeAvroFiles(avroDir, baseName string, rows <-chan ObjectRecord) (err err
 
 			remaining := avroMaxRecordsPerFile - recordsInFile
 			if remaining <= 0 {
+				if err := publishCurrent(); err != nil {
+					return err
+				}
 				if err := openNext(); err != nil {
 					return err
 				}
@@ -635,7 +662,10 @@ func writeAvroFiles(avroDir, baseName string, rows <-chan ObjectRecord) (err err
 		}
 	}
 
-	return flush()
+	if err := flush(); err != nil {
+		return err
+	}
+	return publishCurrent()
 }
 
 const avroObjectRecordSchema = `{
