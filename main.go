@@ -93,7 +93,7 @@ func main() {
 	rootCmd := &cobra.Command{
 		Use:     "nexus-ls <directory>",
 		Short:   "Scans a directory tree and reports file statistics",
-		Version: "1.0.0",
+		Version: "0.8.5",
 		Long: `nexus-ls recursively walks a directory using parallel workers
 and reports the number of files, directories, total size, and performance metrics.`,
 		Args: cobra.ExactArgs(1),
