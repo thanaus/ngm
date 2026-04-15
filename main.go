@@ -13,6 +13,7 @@ import (
 	"runtime/pprof"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/linkedin/goavro/v2"
@@ -21,11 +22,20 @@ import (
 
 var osSep = string([]byte{os.PathSeparator})
 
+type EntryType int32
+
 const (
-	objectKindDir   = "dir"
-	objectKindFile  = "file"
-	objectKindOther = "other"
+	TypeUnknown EntryType = iota
+	TypeFile
+	TypeDir
+	TypeSymlink
+	TypeCharDev
+	TypeDevice
+	TypePipe
+	TypeSocket
 )
+
+const avroMaxRecordsPerFile = 1_000_000
 
 type ScanResult struct {
 	TotalFiles  int64
@@ -41,9 +51,12 @@ type ScanResult struct {
 }
 
 type ObjectRecord struct {
-	Path string
-	Kind string
-	Size int64
+	Path        string
+	Type        EntryType
+	Size        int64
+	MTimeUnixNs int64
+	CTimeUnixNs int64
+	Mode        int64
 }
 
 type avroExport struct {
@@ -193,7 +206,7 @@ func run(root string, workers int, noSize bool, batch int, cpuProfile, memProfil
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runWorker(ctx, q, &result, noSize, batch, exportRows)
+			runWorker(ctx, q, root, &result, noSize, batch, exportRows)
 		}()
 	}
 
@@ -318,7 +331,7 @@ func reportProgress(ctx context.Context, result *ScanResult, start time.Time, no
 	}
 }
 
-func runWorker(ctx context.Context, q *dirQueue, result *ScanResult, noSize bool, batch int, exportRows chan<- ObjectRecord) {
+func runWorker(ctx context.Context, q *dirQueue, root string, result *ScanResult, noSize bool, batch int, exportRows chan<- ObjectRecord) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -333,7 +346,7 @@ func runWorker(ctx context.Context, q *dirQueue, result *ScanResult, noSize bool
 		}
 
 		t1 := time.Now()
-		subdirs := scanDir(ctx, dir, result, noSize, batch, exportRows)
+		subdirs := scanDir(ctx, root, dir, result, noSize, batch, exportRows)
 		atomic.AddInt64(&result.ScanNs, int64(time.Since(t1)))
 
 		q.push(subdirs)
@@ -341,7 +354,7 @@ func runWorker(ctx context.Context, q *dirQueue, result *ScanResult, noSize bool
 	}
 }
 
-func scanDir(ctx context.Context, dir string, result *ScanResult, noSize bool, batch int, exportRows chan<- ObjectRecord) []string {
+func scanDir(ctx context.Context, root, dir string, result *ScanResult, noSize bool, batch int, exportRows chan<- ObjectRecord) []string {
 	f, err := os.Open(dir)
 	if err != nil {
 		log.Printf("[error] open %q: %v", dir, err)
@@ -364,28 +377,32 @@ func scanDir(ctx context.Context, dir string, result *ScanResult, noSize bool, b
 
 		for _, entry := range entries {
 			path := prefix + entry.Name()
+			relativePath := exportRelativePath(root, path)
+			t := time.Now()
+			info, infoErr := entry.Info()
+			atomic.AddInt64(&result.InfoNs, int64(time.Since(t)))
+			if infoErr != nil {
+				log.Printf("[error] info %q: %v", path, infoErr)
+				atomic.AddInt64(&result.TotalErrors, 1)
+			}
 			switch {
 			case entry.IsDir():
 				atomic.AddInt64(&result.TotalDirs, 1)
 				subdirs = append(subdirs, path)
-				if !emitRecord(ctx, exportRows, ObjectRecord{Path: path, Kind: objectKindDir}) {
+				record := ObjectRecord{Path: relativePath, Type: TypeDir}
+				if infoErr == nil {
+					fillRecordFromInfo(&record, info)
+				}
+				if !emitRecord(ctx, exportRows, record) {
 					return subdirs
 				}
 
 			case entry.Type().IsRegular():
 				atomic.AddInt64(&result.TotalFiles, 1)
-				record := ObjectRecord{Path: path, Kind: objectKindFile}
-				if !noSize {
-					t := time.Now()
-					info, infoErr := entry.Info()
-					atomic.AddInt64(&result.InfoNs, int64(time.Since(t)))
-					if infoErr != nil {
-						log.Printf("[error] info %q: %v", path, infoErr)
-						atomic.AddInt64(&result.TotalErrors, 1)
-					} else {
-						record.Size = info.Size()
-						atomic.AddInt64(&result.TotalBytes, record.Size)
-					}
+				record := ObjectRecord{Path: relativePath, Type: TypeFile}
+				if infoErr == nil {
+					fillRecordFromInfo(&record, info)
+					atomic.AddInt64(&result.TotalBytes, record.Size)
 				}
 				if !emitRecord(ctx, exportRows, record) {
 					return subdirs
@@ -393,7 +410,11 @@ func scanDir(ctx context.Context, dir string, result *ScanResult, noSize bool, b
 
 			default:
 				atomic.AddInt64(&result.TotalOthers, 1)
-				if !emitRecord(ctx, exportRows, ObjectRecord{Path: path, Kind: objectKindOther}) {
+				record := ObjectRecord{Path: relativePath, Type: entryTypeFromMode(entry.Type())}
+				if infoErr == nil {
+					fillRecordFromInfo(&record, info)
+				}
+				if !emitRecord(ctx, exportRows, record) {
 					return subdirs
 				}
 			}
@@ -430,19 +451,16 @@ func startAvroExport(avroDir string, workers, batch int) (*avroExport, error) {
 		return nil, fmt.Errorf("could not create avro directory %q: %w", avroDir, err)
 	}
 
-	path := filepath.Join(avroDir, fmt.Sprintf("scan-%s.avro", time.Now().Format("20060102-150405")))
-	f, err := os.Create(path)
-	if err != nil {
-		return nil, fmt.Errorf("could not create avro file %q: %w", path, err)
-	}
+	baseName := fmt.Sprintf("scan-%s", time.Now().Format("20060102-150405"))
+	pathPattern := filepath.Join(avroDir, baseName+"-*.avro")
 
 	exporter := &avroExport{
-		path: path,
+		path: pathPattern,
 		rows: make(chan ObjectRecord, exportBufferSize(workers, batch)),
 		errc: make(chan error, 1),
 	}
 	go func() {
-		exporter.errc <- writeAvroFile(f, exporter.rows)
+		exporter.errc <- writeAvroFiles(avroDir, baseName, exporter.rows)
 	}()
 	return exporter, nil
 }
@@ -462,10 +480,76 @@ func exportBufferSize(workers, batch int) int {
 	return bufferSize
 }
 
-func writeAvroFile(f *os.File, rows <-chan ObjectRecord) (err error) {
+func exportRelativePath(root, path string) string {
+	relativePath, err := filepath.Rel(root, path)
+	if err != nil {
+		return filepath.ToSlash(path)
+	}
+	return filepath.ToSlash(relativePath)
+}
+
+func fillRecordFromInfo(record *ObjectRecord, info os.FileInfo) {
+	record.Type = entryTypeFromMode(info.Mode())
+	record.Size = info.Size()
+	record.MTimeUnixNs = info.ModTime().UnixNano()
+	record.CTimeUnixNs = ctimeUnixNs(info)
+	record.Mode = int64(info.Mode())
+}
+
+func entryTypeFromMode(mode os.FileMode) EntryType {
+	switch {
+	case mode.IsRegular():
+		return TypeFile
+	case mode.IsDir():
+		return TypeDir
+	case mode&os.ModeSymlink != 0:
+		return TypeSymlink
+	case mode&os.ModeSocket != 0:
+		return TypeSocket
+	case mode&os.ModeNamedPipe != 0:
+		return TypePipe
+	case mode&os.ModeDevice != 0 && mode&os.ModeCharDevice != 0:
+		return TypeCharDev
+	case mode&os.ModeDevice != 0:
+		return TypeDevice
+	default:
+		return TypeUnknown
+	}
+}
+
+func ctimeUnixNs(info os.FileInfo) int64 {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0
+	}
+	return stat.Ctim.Sec*1_000_000_000 + stat.Ctim.Nsec
+}
+
+func writeAvroFiles(avroDir, baseName string, rows <-chan ObjectRecord) (err error) {
+	var (
+		f             *os.File
+		writer        *goavro.OCFWriter
+		fileIndex     int
+		recordsInFile int
+	)
+
+	closeCurrent := func() error {
+		if f == nil {
+			return nil
+		}
+		closeErr := f.Close()
+		name := f.Name()
+		f = nil
+		writer = nil
+		recordsInFile = 0
+		if closeErr != nil {
+			return fmt.Errorf("could not close avro file %q: %w", name, closeErr)
+		}
+		return nil
+	}
+
 	defer func() {
-		if closeErr := f.Close(); closeErr != nil {
-			closeErr = fmt.Errorf("could not close avro file %q: %w", f.Name(), closeErr)
+		if closeErr := closeCurrent(); closeErr != nil {
 			if err == nil {
 				err = closeErr
 			} else {
@@ -474,22 +558,62 @@ func writeAvroFile(f *os.File, rows <-chan ObjectRecord) (err error) {
 		}
 	}()
 
-	writer, err := goavro.NewOCFWriter(goavro.OCFConfig{
-		W:               f,
-		Schema:          avroObjectRecordSchema,
-		CompressionName: "deflate",
-	})
-	if err != nil {
-		return fmt.Errorf("could not initialize avro writer %q: %w", f.Name(), err)
+	openNext := func() error {
+		if err := closeCurrent(); err != nil {
+			return err
+		}
+		fileIndex++
+		path := filepath.Join(avroDir, fmt.Sprintf("%s-%06d.avro", baseName, fileIndex))
+		nextFile, err := os.Create(path)
+		if err != nil {
+			return fmt.Errorf("could not create avro file %q: %w", path, err)
+		}
+		nextWriter, err := goavro.NewOCFWriter(goavro.OCFConfig{
+			W:               nextFile,
+			Schema:          avroObjectRecordSchema,
+			CompressionName: "deflate",
+		})
+		if err != nil {
+			closeErr := nextFile.Close()
+			if closeErr != nil {
+				return errors.Join(
+					fmt.Errorf("could not initialize avro writer %q: %w", path, err),
+					fmt.Errorf("could not close avro file %q: %w", path, closeErr),
+				)
+			}
+			return fmt.Errorf("could not initialize avro writer %q: %w", path, err)
+		}
+		f = nextFile
+		writer = nextWriter
+		return nil
 	}
 
 	batch := make([]interface{}, 0, 1024)
 	flush := func() error {
-		if len(batch) == 0 {
-			return nil
-		}
-		if err := writer.Append(batch); err != nil {
-			return fmt.Errorf("could not write avro rows to %q: %w", f.Name(), err)
+		pending := batch
+		for len(pending) > 0 {
+			if writer == nil {
+				if err := openNext(); err != nil {
+					return err
+				}
+			}
+
+			remaining := avroMaxRecordsPerFile - recordsInFile
+			if remaining <= 0 {
+				if err := openNext(); err != nil {
+					return err
+				}
+				remaining = avroMaxRecordsPerFile
+			}
+			if remaining > len(pending) {
+				remaining = len(pending)
+			}
+
+			if err := writer.Append(pending[:remaining]); err != nil {
+				return fmt.Errorf("could not write avro rows to %q: %w", f.Name(), err)
+			}
+			recordsInFile += remaining
+			pending = pending[remaining:]
 		}
 		batch = batch[:0]
 		return nil
@@ -497,9 +621,12 @@ func writeAvroFile(f *os.File, rows <-chan ObjectRecord) (err error) {
 
 	for row := range rows {
 		batch = append(batch, map[string]interface{}{
-			"path": row.Path,
-			"kind": row.Kind,
-			"size": row.Size,
+			"path":          row.Path,
+			"entry_type":    int32(row.Type),
+			"size":          row.Size,
+			"mtime_unix_ns": row.MTimeUnixNs,
+			"ctime_unix_ns": row.CTimeUnixNs,
+			"mode":          row.Mode,
 		})
 		if len(batch) == cap(batch) {
 			if err := flush(); err != nil {
@@ -516,8 +643,11 @@ const avroObjectRecordSchema = `{
   "name": "ObjectRecord",
   "fields": [
     {"name": "path", "type": "string"},
-    {"name": "kind", "type": "string"},
-    {"name": "size", "type": "long"}
+    {"name": "entry_type", "type": "int"},
+    {"name": "size", "type": "long"},
+    {"name": "mtime_unix_ns", "type": "long"},
+    {"name": "ctime_unix_ns", "type": "long"},
+    {"name": "mode", "type": "long"}
   ]
 }`
 
