@@ -66,6 +66,7 @@ type AvroStats struct {
 }
 
 const ensuredParentCacheSize = 128
+const incomingPollInterval = 10 * time.Second
 
 type workerState struct {
 	ensuredParents *recentPathSet
@@ -269,29 +270,41 @@ func processIncomingAvroFiles(ctx CopyContext) error {
 	incomingDir := filepath.Join(ctx.AvroDir, "incoming")
 
 	for {
-		entries, err := os.ReadDir(incomingDir)
+		selectedName, hasDone, err := nextIncomingFile(incomingDir)
 		if err != nil {
 			return fmt.Errorf("could not read incoming directory %q: %w", incomingDir, err)
 		}
-
-		var selectedName string
-		for _, entry := range entries {
-			if entry.IsDir() {
-				continue
+		if selectedName != "" {
+			if err := processOneIncomingAvroFile(ctx, selectedName); err != nil {
+				return err
 			}
-			selectedName = entry.Name()
-			break
+			continue
 		}
-
-		if selectedName == "" {
-			fmt.Println("No file found in incoming.")
+		if hasDone {
 			return nil
 		}
+		time.Sleep(incomingPollInterval)
+	}
+}
 
-		if err := processOneIncomingAvroFile(ctx, selectedName); err != nil {
-			return err
+func nextIncomingFile(incomingDir string) (selectedName string, hasDone bool, err error) {
+	entries, err := os.ReadDir(incomingDir)
+	if err != nil {
+		return "", false, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if entry.Name() == ".done" {
+			hasDone = true
+			continue
+		}
+		if selectedName == "" {
+			selectedName = entry.Name()
 		}
 	}
+	return selectedName, hasDone, nil
 }
 
 func processOneIncomingAvroFile(ctx CopyContext, selectedName string) error {

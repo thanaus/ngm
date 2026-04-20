@@ -225,6 +225,9 @@ func run(root string, workers int, noSize bool, batch int, cpuProfile, memProfil
 			return err
 		}
 	}
+	if err := writeDoneFile(avroDir); err != nil {
+		return err
+	}
 
 	elapsed := time.Since(start)
 	dirs  := atomic.LoadInt64(&result.TotalDirs)
@@ -475,6 +478,22 @@ func (e *avroExport) wait() error {
 		return nil
 	}
 	return <-e.errc
+}
+
+func writeDoneFile(avroDir string) error {
+	if avroDir == "" {
+		return nil
+	}
+
+	donePath := filepath.Join(avroDir, "incoming", ".done")
+	f, err := os.Create(donePath)
+	if err != nil {
+		return fmt.Errorf("could not create done file %q: %w", donePath, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("could not close done file %q: %w", donePath, err)
+	}
+	return nil
 }
 
 func exportBufferSize(workers, batch int) int {
