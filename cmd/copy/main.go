@@ -268,6 +268,7 @@ func requireDir(path string) error {
 
 func processIncomingAvroFiles(ctx CopyContext) error {
 	incomingDir := filepath.Join(ctx.AvroDir, "incoming")
+	var shardErrors []error
 
 	for {
 		selectedName, hasDone, err := nextIncomingFile(incomingDir)
@@ -275,13 +276,21 @@ func processIncomingAvroFiles(ctx CopyContext) error {
 			return fmt.Errorf("could not read incoming directory %q: %w", incomingDir, err)
 		}
 		if selectedName != "" {
-			if err := processOneIncomingAvroFile(ctx, selectedName); err != nil {
-				return err
+			processErr, fatalErr := processOneIncomingAvroFile(ctx, selectedName)
+			if fatalErr != nil {
+				return fatalErr
+			}
+			if processErr != nil {
+				fmt.Fprintf(os.Stderr, "[error] processing %q: %v\n", selectedName, processErr)
+				shardErrors = append(shardErrors, processErr)
 			}
 			continue
 		}
 		if hasDone {
-			return nil
+			if len(shardErrors) == 0 {
+				return nil
+			}
+			return fmt.Errorf("encountered errors while processing %d avro file(s); see logs above", len(shardErrors))
 		}
 		time.Sleep(incomingPollInterval)
 	}
@@ -307,10 +316,10 @@ func nextIncomingFile(incomingDir string) (selectedName string, hasDone bool, er
 	return selectedName, hasDone, nil
 }
 
-func processOneIncomingAvroFile(ctx CopyContext, selectedName string) error {
+func processOneIncomingAvroFile(ctx CopyContext, selectedName string) (processErr error, fatalErr error) {
 	hostname, err := os.Hostname()
 	if err != nil {
-		return fmt.Errorf("could not determine hostname: %w", err)
+		return nil, fmt.Errorf("could not determine hostname: %w", err)
 	}
 
 	incomingDir := filepath.Join(ctx.AvroDir, "incoming")
@@ -323,12 +332,12 @@ func processOneIncomingAvroFile(ctx CopyContext, selectedName string) error {
 	processingPath := filepath.Join(processingDir, processingName)
 
 	if err := os.Rename(sourcePath, processingPath); err != nil {
-		return fmt.Errorf("could not move %q to %q: %w", sourcePath, processingPath, err)
+		return nil, fmt.Errorf("could not move %q to %q: %w", sourcePath, processingPath, err)
 	}
 
 	fmt.Printf("Processing  : %s\n\n", processingPath)
 	var stats AvroStats
-	processErr := processAvroPaths(ctx, processingPath, &stats)
+	processErr = processAvroPaths(ctx, processingPath, &stats)
 	printAvroStats(&stats)
 
 	targetDir := doneDir
@@ -342,13 +351,13 @@ func processOneIncomingAvroFile(ctx CopyContext, selectedName string) error {
 	if err := os.Rename(processingPath, finalPath); err != nil {
 		moveErr := fmt.Errorf("could not move %q to %q: %w", processingPath, finalPath, err)
 		if processErr != nil {
-			return errors.Join(processErr, moveErr)
+			return nil, errors.Join(processErr, moveErr)
 		}
-		return moveErr
+		return nil, moveErr
 	}
 
 	fmt.Printf("\n%-12s%s\n\n", targetLabel, finalPath)
-	return processErr
+	return processErr, nil
 }
 
 func addProcessingSuffix(name, hostname string, pid int) string {

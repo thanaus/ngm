@@ -72,6 +72,53 @@ type dirQueue struct {
 	busy int
 }
 
+type stderrPrinter struct {
+	mu              sync.Mutex
+	progressVisible bool
+}
+
+func (p *stderrPrinter) PrintProgress(line string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.progressVisible {
+		fmt.Fprint(os.Stderr, "\r")
+	}
+	fmt.Fprintf(os.Stderr, "%s\033[K", line)
+	p.progressVisible = true
+}
+
+func (p *stderrPrinter) Println() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.progressVisible {
+		return
+	}
+	fmt.Fprintln(os.Stderr)
+	p.progressVisible = false
+}
+
+func (p *stderrPrinter) Logf(format string, args ...any) {
+	if p == nil {
+		log.Printf(format, args...)
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	hadProgress := p.progressVisible
+	if hadProgress {
+		fmt.Fprint(os.Stderr, "\n\n")
+		p.progressVisible = false
+	}
+	log.Printf(format, args...)
+	if hadProgress {
+		fmt.Fprintln(os.Stderr)
+	}
+}
+
 func newDirQueue(root string) *dirQueue {
 	q := &dirQueue{dirs: []string{root}}
 	q.cond = sync.NewCond(&q.mu)
@@ -159,6 +206,7 @@ and reports the number of files, directories, total size, and performance metric
 func run(root string, workers int, noSize bool, batch int, cpuProfile, memProfile, avroDir string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
+	printer := &stderrPrinter{}
 
 	if cpuProfile != "" {
 		f, err := os.Create(cpuProfile)
@@ -172,7 +220,7 @@ func run(root string, workers int, noSize bool, batch int, cpuProfile, memProfil
 		defer func() {
 			pprof.StopCPUProfile()
 			if err := f.Close(); err != nil {
-				log.Printf("[error] close CPU profile %q: %v", cpuProfile, err)
+				printer.Logf("[error] close CPU profile %q: %v", cpuProfile, err)
 			}
 		}()
 	}
@@ -199,14 +247,14 @@ func run(root string, workers int, noSize bool, batch int, cpuProfile, memProfil
 	reporterWg.Add(1)
 	go func() {
 		defer reporterWg.Done()
-		reportProgress(ctx, &result, start, noSize)
+		reportProgress(ctx, printer, &result, start, noSize)
 	}()
 
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runWorker(ctx, q, root, &result, noSize, batch, exportRows)
+			runWorker(ctx, q, printer, root, &result, noSize, batch, exportRows)
 		}()
 	}
 
@@ -266,13 +314,13 @@ func run(root string, workers int, noSize bool, batch int, cpuProfile, memProfil
 		fmt.Printf("  %-10s%.1f%%\n", "readdir", 100*readDirNs/scanNs)
 		fmt.Printf("  %-10s%.1f%%\n", "lstat", 100*infoNs/scanNs)
 	}
-	if err := writeHeapProfile(memProfile); err != nil {
+	if err := writeHeapProfile(memProfile, printer); err != nil {
 		return err
 	}
 	return nil
 }
 
-func writeHeapProfile(path string) error {
+func writeHeapProfile(path string, printer *stderrPrinter) error {
 	if path == "" {
 		return nil
 	}
@@ -283,7 +331,7 @@ func writeHeapProfile(path string) error {
 	}
 	defer func() {
 		if closeErr := f.Close(); closeErr != nil {
-			log.Printf("[error] close memory profile %q: %v", path, closeErr)
+			printer.Logf("[error] close memory profile %q: %v", path, closeErr)
 		}
 	}()
 
@@ -295,16 +343,15 @@ func writeHeapProfile(path string) error {
 	return nil
 }
 
-func reportProgress(ctx context.Context, result *ScanResult, start time.Time, noSize bool) {
+func reportProgress(ctx context.Context, printer *stderrPrinter, result *ScanResult, start time.Time, noSize bool) {
 	const interval = 30 * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	var prevObjects int64
-	firstPrint := true
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Fprintf(os.Stderr, "\n")
+			printer.Println()
 			return
 		case <-ticker.C:
 			dirs  := atomic.LoadInt64(&result.TotalDirs)
@@ -325,16 +372,12 @@ func reportProgress(ctx context.Context, result *ScanResult, start time.Time, no
 				}
 			}
 
-			if !firstPrint {
-				fmt.Fprintf(os.Stderr, "\r")
-			}
-			fmt.Fprintf(os.Stderr, "%s\033[K", line)
-			firstPrint = false
+			printer.PrintProgress(line)
 		}
 	}
 }
 
-func runWorker(ctx context.Context, q *dirQueue, root string, result *ScanResult, noSize bool, batch int, exportRows chan<- ObjectRecord) {
+func runWorker(ctx context.Context, q *dirQueue, printer *stderrPrinter, root string, result *ScanResult, noSize bool, batch int, exportRows chan<- ObjectRecord) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -349,7 +392,7 @@ func runWorker(ctx context.Context, q *dirQueue, root string, result *ScanResult
 		}
 
 		t1 := time.Now()
-		subdirs := scanDir(ctx, root, dir, result, noSize, batch, exportRows)
+		subdirs := scanDir(ctx, printer, root, dir, result, noSize, batch, exportRows)
 		atomic.AddInt64(&result.ScanNs, int64(time.Since(t1)))
 
 		q.push(subdirs)
@@ -357,10 +400,10 @@ func runWorker(ctx context.Context, q *dirQueue, root string, result *ScanResult
 	}
 }
 
-func scanDir(ctx context.Context, root, dir string, result *ScanResult, noSize bool, batch int, exportRows chan<- ObjectRecord) []string {
+func scanDir(ctx context.Context, printer *stderrPrinter, root, dir string, result *ScanResult, noSize bool, batch int, exportRows chan<- ObjectRecord) []string {
 	f, err := os.Open(dir)
 	if err != nil {
-		log.Printf("[error] open %q: %v", dir, err)
+		printer.Logf("[error] open %q: %v", dir, err)
 		atomic.AddInt64(&result.TotalErrors, 1)
 		return nil
 	}
@@ -385,7 +428,7 @@ func scanDir(ctx context.Context, root, dir string, result *ScanResult, noSize b
 			info, infoErr := entry.Info()
 			atomic.AddInt64(&result.InfoNs, int64(time.Since(t)))
 			if infoErr != nil {
-				log.Printf("[error] info %q: %v", path, infoErr)
+				printer.Logf("[error] info %q: %v", path, infoErr)
 				atomic.AddInt64(&result.TotalErrors, 1)
 			}
 			switch {
@@ -424,7 +467,7 @@ func scanDir(ctx context.Context, root, dir string, result *ScanResult, noSize b
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				log.Printf("[error] readdir %q: %v", dir, err)
+				printer.Logf("[error] readdir %q: %v", dir, err)
 				atomic.AddInt64(&result.TotalErrors, 1)
 			}
 			break
