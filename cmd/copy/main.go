@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,9 +59,10 @@ type DirectoryMetadata struct {
 }
 
 type AvroStats struct {
-	TotalDirs  int64
-	TotalFiles int64
-	TotalBytes int64
+	TotalDirs   int64
+	TotalFiles  int64
+	TotalOthers int64
+	TotalBytes  int64
 }
 
 const ensuredParentCacheSize = 128
@@ -103,6 +105,22 @@ func (p *stderrPrinter) Println() {
 	p.progressVisible = false
 }
 
+func (p *stderrPrinter) Logf(format string, args ...any) {
+	if p == nil {
+		log.Printf(format, args...)
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.progressVisible {
+		fmt.Fprintln(os.Stderr)
+		p.progressVisible = false
+	}
+	log.Printf(format, args...)
+}
+
 func newWorkerState() *workerState {
 	return &workerState{
 		ensuredParents: newRecentPathSet(ensuredParentCacheSize),
@@ -140,17 +158,38 @@ func (s *recentPathSet) add(path string) {
 }
 
 type workerErrorSink struct {
-	once sync.Once
-	err  error
+	mu    sync.Mutex
+	once  sync.Once
+	err   error
+	count int64
+	logf  func(error)
 }
 
 func (s *workerErrorSink) set(err error) {
 	if err == nil {
 		return
 	}
+	s.mu.Lock()
+	s.count++
+	logf := s.logf
+	s.mu.Unlock()
+
 	s.once.Do(func() {
 		s.err = err
 	})
+	if logf != nil {
+		logf(err)
+	}
+}
+
+func (s *workerErrorSink) errorCount() int64 {
+	if s == nil {
+		return 0
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.count
 }
 
 func (ctx CopyContext) sourcePathFor(recordPath string) string {
@@ -288,7 +327,10 @@ func requireDir(path string) error {
 
 func processIncomingAvroFiles(ctx CopyContext) error {
 	incomingDir := filepath.Join(ctx.AvroDir, "incoming")
-	var shardErrors []error
+	totalStart := time.Now()
+	var totalStats AvroStats
+	var totalErrors int64
+	totalPrinted := false
 
 	for {
 		selectedName, hasDone, err := nextIncomingFile(incomingDir)
@@ -296,21 +338,25 @@ func processIncomingAvroFiles(ctx CopyContext) error {
 			return fmt.Errorf("could not read incoming directory %q: %w", incomingDir, err)
 		}
 		if selectedName != "" {
-			processErr, fatalErr := processOneIncomingAvroFile(ctx, selectedName)
+			shardStats, shardErrorCount, _, fatalErr := processOneIncomingAvroFile(ctx, selectedName)
 			if fatalErr != nil {
 				return fatalErr
 			}
-			if processErr != nil {
-				fmt.Fprintf(os.Stderr, "[error] processing %q: %v\n", selectedName, processErr)
-				shardErrors = append(shardErrors, processErr)
-			}
+			totalStats.TotalDirs += shardStats.TotalDirs
+			totalStats.TotalFiles += shardStats.TotalFiles
+			totalStats.TotalOthers += shardStats.TotalOthers
+			totalStats.TotalBytes += shardStats.TotalBytes
+			totalErrors += shardErrorCount
+			fmt.Printf("[total %s] %s\n\n", compactDuration(time.Since(totalStart)), formatAvroSummary(&totalStats))
+			totalPrinted = true
 			continue
 		}
 		if hasDone {
-			if len(shardErrors) == 0 {
-				return nil
+			if !totalPrinted {
+				fmt.Printf("[total %s] %s\n", compactDuration(time.Since(totalStart)), formatAvroSummary(&totalStats))
 			}
-			return fmt.Errorf("encountered errors while processing %d avro file(s); see logs above", len(shardErrors))
+			printCopySummary(ctx, totalStart, &totalStats, totalErrors)
+			return nil
 		}
 		time.Sleep(incomingPollInterval)
 	}
@@ -336,10 +382,10 @@ func nextIncomingFile(incomingDir string) (selectedName string, hasDone bool, er
 	return selectedName, hasDone, nil
 }
 
-func processOneIncomingAvroFile(ctx CopyContext, selectedName string) (processErr error, fatalErr error) {
+func processOneIncomingAvroFile(ctx CopyContext, selectedName string) (stats AvroStats, errorCount int64, processErr error, fatalErr error) {
 	hostname, err := os.Hostname()
 	if err != nil {
-		return nil, fmt.Errorf("could not determine hostname: %w", err)
+		return stats, 0, nil, fmt.Errorf("could not determine hostname: %w", err)
 	}
 
 	incomingDir := filepath.Join(ctx.AvroDir, "incoming")
@@ -352,11 +398,10 @@ func processOneIncomingAvroFile(ctx CopyContext, selectedName string) (processEr
 	processingPath := filepath.Join(processingDir, processingName)
 
 	if err := os.Rename(sourcePath, processingPath); err != nil {
-		return nil, fmt.Errorf("could not move %q to %q: %w", sourcePath, processingPath, err)
+		return stats, 0, nil, fmt.Errorf("could not move %q to %q: %w", sourcePath, processingPath, err)
 	}
 
 	fmt.Printf("[start] %s\n", selectedName)
-	var stats AvroStats
 	start := time.Now()
 	printer := &stderrPrinter{}
 	progressCtx, cancelProgress := context.WithCancel(context.Background())
@@ -367,7 +412,11 @@ func processOneIncomingAvroFile(ctx CopyContext, selectedName string) (processEr
 		reportAvroProgress(progressCtx, printer, &stats, start)
 	}()
 
-	processErr = processAvroPaths(ctx, processingPath, &stats)
+	processErr, errorCount = processAvroPaths(ctx, processingPath, &stats, &workerErrorSink{
+		logf: func(err error) {
+			printer.Logf("[error] processing %q: %v", selectedName, err)
+		},
+	})
 	cancelProgress()
 	progressWg.Wait()
 
@@ -381,14 +430,15 @@ func processOneIncomingAvroFile(ctx CopyContext, selectedName string) (processEr
 	finalPath := filepath.Join(targetDir, filepath.Base(processingPath))
 	if err := os.Rename(processingPath, finalPath); err != nil {
 		moveErr := fmt.Errorf("could not move %q to %q: %w", processingPath, finalPath, err)
+		errorCount++
 		if processErr != nil {
-			return nil, errors.Join(processErr, moveErr)
+			return stats, errorCount, nil, errors.Join(processErr, moveErr)
 		}
-		return nil, moveErr
+		return stats, errorCount, nil, moveErr
 	}
 
-	fmt.Printf("[%s %s] %s\n\n", targetLabel, compactDuration(time.Since(start)), formatAvroSummary(&stats))
-	return processErr, nil
+	fmt.Printf("[%s %s] %s\n", targetLabel, compactDuration(time.Since(start)), formatAvroSummary(&stats))
+	return stats, errorCount, processErr, nil
 }
 
 func addProcessingSuffix(name, hostname string, pid int) string {
@@ -400,30 +450,37 @@ func addProcessingSuffix(name, hostname string, pid int) string {
 	return fmt.Sprintf("%s.%s.%d%s", base, hostname, pid, ext)
 }
 
-func processAvroPaths(ctx CopyContext, path string, stats *AvroStats) error {
+func processAvroPaths(ctx CopyContext, path string, stats *AvroStats, workerErrors *workerErrorSink) (error, int64) {
 	records := make(chan CopyRecord, recordBufferSize(ctx.Workers))
 	var wg sync.WaitGroup
-	var workerErrors workerErrorSink
+
+	if workerErrors == nil {
+		workerErrors = &workerErrorSink{}
+	}
 
 	for i := 0; i < ctx.Workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			copyWorker(ctx, newWorkerState(), records, stats, &workerErrors)
+			copyWorker(ctx, newWorkerState(), records, stats, workerErrors)
 		}()
 	}
 
 	readErr := readAvroRecords(path, records)
 	close(records)
 	wg.Wait()
+	errorCount := workerErrors.errorCount()
+	if readErr != nil {
+		errorCount++
+	}
 
 	if readErr != nil && workerErrors.err != nil {
-		return errors.Join(readErr, workerErrors.err)
+		return errors.Join(readErr, workerErrors.err), errorCount
 	}
 	if readErr != nil {
-		return readErr
+		return readErr, errorCount
 	}
-	return workerErrors.err
+	return workerErrors.err, errorCount
 }
 
 func copyWorker(ctx CopyContext, state *workerState, records <-chan CopyRecord, stats *AvroStats, workerErrors *workerErrorSink) {
@@ -441,7 +498,7 @@ func processRecord(ctx CopyContext, state *workerState, record CopyRecord, stats
 	case TypeFile:
 		return processFileRecord(ctx, state, record, stats)
 	default:
-		return processOtherRecord(ctx, record)
+		return processOtherRecord(ctx, record, stats)
 	}
 }
 
@@ -599,18 +656,44 @@ func processFileRecord(ctx CopyContext, state *workerState, record CopyRecord, s
 	return nil
 }
 
-func processOtherRecord(ctx CopyContext, record CopyRecord) error {
+func processOtherRecord(ctx CopyContext, record CopyRecord, stats *AvroStats) error {
 	destinationPath := ctx.destinationPathFor(record.Path)
 
 	_, err := os.Stat(destinationPath)
 	switch {
 	case err == nil:
+		if stats != nil {
+			atomic.AddInt64(&stats.TotalOthers, 1)
+		}
 		return nil
 	case os.IsNotExist(err):
+		if stats != nil {
+			atomic.AddInt64(&stats.TotalOthers, 1)
+		}
 		return nil
 	default:
 		return fmt.Errorf("could not stat destination path %q: %w", destinationPath, err)
 	}
+}
+
+func printCopySummary(ctx CopyContext, start time.Time, stats *AvroStats, errorCount int64) {
+	elapsed := time.Since(start)
+	dirs := atomic.LoadInt64(&stats.TotalDirs)
+	files := atomic.LoadInt64(&stats.TotalFiles)
+	others := atomic.LoadInt64(&stats.TotalOthers)
+	rate := float64(dirs+files) / elapsed.Seconds()
+
+	fmt.Printf("\nCopie complete\n\n")
+	fmt.Printf("%-18s%s\n", "Source Path", ctx.SourceDir)
+	fmt.Printf("%-18s%s\n", "Destination Path", ctx.DestinationDir)
+	fmt.Printf("%-18s%s • %s obj/s\n\n", "Duration", compactDuration(elapsed), humanSI(int64(rate)))
+	fmt.Printf("%-18s%s dirs • %s files • %s others\n", "Entries",
+		humanSI(dirs),
+		humanSI(files),
+		humanSI(others),
+	)
+	fmt.Printf("%-18s%s\n", "Total size", humanBytes(atomic.LoadInt64(&stats.TotalBytes)))
+	fmt.Printf("%-18s%d\n\n", "Errors", errorCount)
 }
 
 func applyDirectoryMetadata(destinationPath string, metadata DirectoryMetadata) error {

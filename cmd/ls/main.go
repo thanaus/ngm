@@ -493,11 +493,23 @@ func startAvroExport(avroDir string, workers, batch int) (*avroExport, error) {
 	}
 	tmpDir := filepath.Join(avroDir, "tmp")
 	incomingDir := filepath.Join(avroDir, "incoming")
+	processingDir := filepath.Join(avroDir, "processing")
+	doneDir := filepath.Join(avroDir, "done")
+	errorDir := filepath.Join(avroDir, "error")
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		return nil, fmt.Errorf("could not create avro tmp directory %q: %w", tmpDir, err)
 	}
 	if err := os.MkdirAll(incomingDir, 0o755); err != nil {
 		return nil, fmt.Errorf("could not create avro incoming directory %q: %w", incomingDir, err)
+	}
+	if err := os.MkdirAll(processingDir, 0o755); err != nil {
+		return nil, fmt.Errorf("could not create avro processing directory %q: %w", processingDir, err)
+	}
+	if err := os.MkdirAll(doneDir, 0o755); err != nil {
+		return nil, fmt.Errorf("could not create avro done directory %q: %w", doneDir, err)
+	}
+	if err := os.MkdirAll(errorDir, 0o755); err != nil {
+		return nil, fmt.Errorf("could not create avro error directory %q: %w", errorDir, err)
 	}
 
 	baseName := fmt.Sprintf("scan-%s", time.Now().Format("20060102-150405"))
