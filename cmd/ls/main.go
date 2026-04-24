@@ -110,13 +110,10 @@ func (p *stderrPrinter) Logf(format string, args ...any) {
 
 	hadProgress := p.progressVisible
 	if hadProgress {
-		fmt.Fprint(os.Stderr, "\n\n")
+		fmt.Fprintln(os.Stderr)
 		p.progressVisible = false
 	}
 	log.Printf(format, args...)
-	if hadProgress {
-		fmt.Fprintln(os.Stderr)
-	}
 }
 
 func newDirQueue(root string) *dirQueue {
@@ -191,12 +188,12 @@ and reports the number of files, directories, total size, and performance metric
 		},
 	}
 
-	rootCmd.Flags().IntVarP(&workers,       "jobs",       "j", 4,     "Number of parallel workers")
-	rootCmd.Flags().BoolVarP(&noSize,       "no-size",    "s", false, "Skip file size collection (avoids one lstat per file)")
-	rootCmd.Flags().IntVarP(&batch,         "batch",      "b", 256,   "Number of entries read per ReadDir syscall (getdents64 batch size)")
-	rootCmd.Flags().StringVarP(&cpuProfile, "cpuprofile", "p", "",    "Write CPU profile to this file (analyse with: go tool pprof -top <file>)")
-	rootCmd.Flags().StringVar(&memProfile,  "memprofile", "",         "Write heap profile to this file (analyse with: go tool pprof -top <binary> <file>)")
-	rootCmd.Flags().StringVar(&avroDir,     "avro-dir", "",           "Write scanned objects to an avro file in this directory")
+	rootCmd.Flags().IntVarP(&workers, "jobs", "j", 4, "Number of parallel workers")
+	rootCmd.Flags().BoolVarP(&noSize, "no-size", "s", false, "Skip file size collection (avoids one lstat per file)")
+	rootCmd.Flags().IntVarP(&batch, "batch", "b", 256, "Number of entries read per ReadDir syscall (getdents64 batch size)")
+	rootCmd.Flags().StringVarP(&cpuProfile, "cpuprofile", "p", "", "Write CPU profile to this file (analyse with: go tool pprof -top <file>)")
+	rootCmd.Flags().StringVar(&memProfile, "memprofile", "", "Write heap profile to this file (analyse with: go tool pprof -top <binary> <file>)")
+	rootCmd.Flags().StringVar(&avroDir, "avro-dir", "", "Write scanned objects to an avro file in this directory")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -278,9 +275,9 @@ func run(root string, workers int, noSize bool, batch int, cpuProfile, memProfil
 	}
 
 	elapsed := time.Since(start)
-	dirs  := atomic.LoadInt64(&result.TotalDirs)
+	dirs := atomic.LoadInt64(&result.TotalDirs)
 	files := atomic.LoadInt64(&result.TotalFiles)
-	rate  := float64(dirs+files) / elapsed.Seconds()
+	rate := float64(dirs+files) / elapsed.Seconds()
 
 	status := "Scan complete"
 	if interrupted {
@@ -294,19 +291,20 @@ func run(root string, workers int, noSize bool, batch int, cpuProfile, memProfil
 		humanSI(files),
 		humanSI(atomic.LoadInt64(&result.TotalOthers)),
 	)
-	fmt.Printf("%-12s%d\n", "Errors", atomic.LoadInt64(&result.TotalErrors))
-	fmt.Printf("%-12s%s\n\n", "Size", humanBytes(atomic.LoadInt64(&result.TotalBytes)))
+	fmt.Printf("%-12s%s\n", "Total size", humanBytes(atomic.LoadInt64(&result.TotalBytes)))
+	fmt.Printf("%-12s%d\n\n", "Errors", atomic.LoadInt64(&result.TotalErrors))
 	if exportPath != "" {
-		fmt.Printf("%-12s%s\n\n", exportLabel, exportPath)
+		fmt.Printf("Output\n")
+		fmt.Printf("  %-10s%s\n\n", exportLabel, exportPath)
 	}
 
 	totalWorkerNs := float64(workers) * float64(elapsed.Nanoseconds())
-	idleNs        := float64(atomic.LoadInt64(&result.IdleNs))
-	scanNs        := float64(atomic.LoadInt64(&result.ScanNs))
-	readDirNs     := float64(atomic.LoadInt64(&result.ReadDirNs))
-	infoNs        := float64(atomic.LoadInt64(&result.InfoNs))
-	pctIdle       := 100 * idleNs / totalWorkerNs
-	pctScan       := 100 * scanNs / totalWorkerNs
+	idleNs := float64(atomic.LoadInt64(&result.IdleNs))
+	scanNs := float64(atomic.LoadInt64(&result.ScanNs))
+	readDirNs := float64(atomic.LoadInt64(&result.ReadDirNs))
+	infoNs := float64(atomic.LoadInt64(&result.InfoNs))
+	pctIdle := 100 * idleNs / totalWorkerNs
+	pctScan := 100 * scanNs / totalWorkerNs
 
 	fmt.Printf("Performance\n")
 	fmt.Printf("  %-10s%.1f%% busy • %.1f%% idle\n", "workers", pctScan, pctIdle)
@@ -354,10 +352,10 @@ func reportProgress(ctx context.Context, printer *stderrPrinter, result *ScanRes
 			printer.Println()
 			return
 		case <-ticker.C:
-			dirs  := atomic.LoadInt64(&result.TotalDirs)
+			dirs := atomic.LoadInt64(&result.TotalDirs)
 			files := atomic.LoadInt64(&result.TotalFiles)
 			total := dirs + files
-			rate  := float64(total-prevObjects) / interval.Seconds()
+			rate := float64(total-prevObjects) / interval.Seconds()
 			prevObjects = total
 
 			line := fmt.Sprintf("[%s] %s dirs • %s files • %s obj/s",
@@ -594,11 +592,11 @@ func ctimeUnixNs(info os.FileInfo) int64 {
 
 func writeAvroFiles(tmpDir, incomingDir, baseName string, rows <-chan ObjectRecord) (err error) {
 	var (
-		f                  *os.File
-		writer             *goavro.OCFWriter
-		fileIndex          int
-		recordsInFile      int
-		currentTmpPath     string
+		f                   *os.File
+		writer              *goavro.OCFWriter
+		fileIndex           int
+		recordsInFile       int
+		currentTmpPath      string
 		currentIncomingPath string
 	)
 

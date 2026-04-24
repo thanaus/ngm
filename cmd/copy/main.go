@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -57,12 +58,9 @@ type DirectoryMetadata struct {
 }
 
 type AvroStats struct {
-	DirsCreated int64
-	DirsUpdated int64
-	DirsOK      int64
-	FilesCreated int64
-	FilesUpdated int64
-	FilesOK      int64
+	TotalDirs  int64
+	TotalFiles int64
+	TotalBytes int64
 }
 
 const ensuredParentCacheSize = 128
@@ -76,6 +74,33 @@ type recentPathSet struct {
 	capacity int
 	paths    []string
 	index    map[string]int
+}
+
+type stderrPrinter struct {
+	mu              sync.Mutex
+	progressVisible bool
+}
+
+func (p *stderrPrinter) PrintProgress(line string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.progressVisible {
+		fmt.Fprint(os.Stderr, "\r")
+	}
+	fmt.Fprintf(os.Stderr, "%s\033[K", line)
+	p.progressVisible = true
+}
+
+func (p *stderrPrinter) Println() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.progressVisible {
+		return
+	}
+	fmt.Fprintln(os.Stderr)
+	p.progressVisible = false
 }
 
 func newWorkerState() *workerState {
@@ -192,12 +217,7 @@ This is only a skeleton for now and the actual copy logic will be added later.`,
 }
 
 func run(ctx CopyContext) error {
-	fmt.Printf("Source      : %s\n", ctx.SourceDir)
-	fmt.Printf("Destination : %s\n", ctx.DestinationDir)
 	if ctx.AvroDir != "" {
-		fmt.Printf("Avro dir    : %s\n", ctx.AvroDir)
-		fmt.Printf("Workers     : %d\n", ctx.Workers)
-		fmt.Println()
 		return processIncomingAvroFiles(ctx)
 	}
 	fmt.Println()
@@ -335,16 +355,27 @@ func processOneIncomingAvroFile(ctx CopyContext, selectedName string) (processEr
 		return nil, fmt.Errorf("could not move %q to %q: %w", sourcePath, processingPath, err)
 	}
 
-	fmt.Printf("Processing  : %s\n\n", processingPath)
+	fmt.Printf("[start] %s\n", selectedName)
 	var stats AvroStats
+	start := time.Now()
+	printer := &stderrPrinter{}
+	progressCtx, cancelProgress := context.WithCancel(context.Background())
+	var progressWg sync.WaitGroup
+	progressWg.Add(1)
+	go func() {
+		defer progressWg.Done()
+		reportAvroProgress(progressCtx, printer, &stats, start)
+	}()
+
 	processErr = processAvroPaths(ctx, processingPath, &stats)
-	printAvroStats(&stats)
+	cancelProgress()
+	progressWg.Wait()
 
 	targetDir := doneDir
-	targetLabel := "Done"
+	targetLabel := "done"
 	if processErr != nil {
 		targetDir = errorDir
-		targetLabel = "Error"
+		targetLabel = "error"
 	}
 
 	finalPath := filepath.Join(targetDir, filepath.Base(processingPath))
@@ -356,7 +387,7 @@ func processOneIncomingAvroFile(ctx CopyContext, selectedName string) (processEr
 		return nil, moveErr
 	}
 
-	fmt.Printf("\n%-12s%s\n\n", targetLabel, finalPath)
+	fmt.Printf("[%s %s] %s\n\n", targetLabel, compactDuration(time.Since(start)), formatAvroSummary(&stats))
 	return processErr, nil
 }
 
@@ -443,7 +474,7 @@ func processDirectoryRecord(ctx CopyContext, state *workerState, record CopyReco
 		}
 		if matches {
 			if stats != nil {
-				atomic.AddInt64(&stats.DirsOK, 1)
+				atomic.AddInt64(&stats.TotalDirs, 1)
 			}
 			return nil
 		}
@@ -457,27 +488,18 @@ func processDirectoryRecord(ctx CopyContext, state *workerState, record CopyReco
 		return err
 	}
 
-	created := false
 	if err := os.Mkdir(destinationPath, metadata.Mode.Perm()); err != nil {
 		if !os.IsExist(err) {
 			return fmt.Errorf("could not create destination directory %q: %w", destinationPath, err)
 		}
-	} else {
-		created = true
 	}
 
 	if err := applyDirectoryMetadata(destinationPath, metadata); err != nil {
 		return err
 	}
 
-	if created {
-		if stats != nil {
-			atomic.AddInt64(&stats.DirsCreated, 1)
-		}
-	} else {
-		if stats != nil {
-			atomic.AddInt64(&stats.DirsUpdated, 1)
-		}
+	if stats != nil {
+		atomic.AddInt64(&stats.TotalDirs, 1)
 	}
 	return nil
 }
@@ -521,7 +543,8 @@ func processFileRecord(ctx CopyContext, state *workerState, record CopyRecord, s
 			return err
 		}
 		if stats != nil {
-			atomic.AddInt64(&stats.FilesCreated, 1)
+			atomic.AddInt64(&stats.TotalFiles, 1)
+			atomic.AddInt64(&stats.TotalBytes, record.Size)
 		}
 		return nil
 	default:
@@ -544,7 +567,8 @@ func processFileRecord(ctx CopyContext, state *workerState, record CopyRecord, s
 			return err
 		}
 		if stats != nil {
-			atomic.AddInt64(&stats.FilesUpdated, 1)
+			atomic.AddInt64(&stats.TotalFiles, 1)
+			atomic.AddInt64(&stats.TotalBytes, record.Size)
 		}
 		return nil
 	}
@@ -555,7 +579,8 @@ func processFileRecord(ctx CopyContext, state *workerState, record CopyRecord, s
 	}
 	if destinationCTime >= record.CTimeUnixNs {
 		if stats != nil {
-			atomic.AddInt64(&stats.FilesOK, 1)
+			atomic.AddInt64(&stats.TotalFiles, 1)
+			atomic.AddInt64(&stats.TotalBytes, record.Size)
 		}
 		return nil
 	}
@@ -568,7 +593,8 @@ func processFileRecord(ctx CopyContext, state *workerState, record CopyRecord, s
 		return err
 	}
 	if stats != nil {
-		atomic.AddInt64(&stats.FilesUpdated, 1)
+		atomic.AddInt64(&stats.TotalFiles, 1)
+		atomic.AddInt64(&stats.TotalBytes, record.Size)
 	}
 	return nil
 }
@@ -668,18 +694,58 @@ func sameXattrs(left, right map[string][]byte) bool {
 	return true
 }
 
-func printAvroStats(stats *AvroStats) {
+func formatAvroSummary(stats *AvroStats) string {
 	if stats == nil {
-		return
+		return ""
 	}
-	fmt.Printf("\nDirectory stats\n")
-	fmt.Printf("  created  %d\n", atomic.LoadInt64(&stats.DirsCreated))
-	fmt.Printf("  updated  %d\n", atomic.LoadInt64(&stats.DirsUpdated))
-	fmt.Printf("  ok       %d\n", atomic.LoadInt64(&stats.DirsOK))
-	fmt.Printf("\nFile stats\n")
-	fmt.Printf("  created  %d\n", atomic.LoadInt64(&stats.FilesCreated))
-	fmt.Printf("  updated  %d\n", atomic.LoadInt64(&stats.FilesUpdated))
-	fmt.Printf("  ok       %d\n\n", atomic.LoadInt64(&stats.FilesOK))
+
+	return fmt.Sprintf("%s dirs • %s files • %s",
+		humanSI(atomic.LoadInt64(&stats.TotalDirs)),
+		humanSI(atomic.LoadInt64(&stats.TotalFiles)),
+		humanBytes(atomic.LoadInt64(&stats.TotalBytes)),
+	)
+}
+
+func reportAvroProgress(ctx context.Context, printer *stderrPrinter, stats *AvroStats, start time.Time) {
+	const interval = 30 * time.Second
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var prevObjects int64
+
+	for {
+		select {
+		case <-ctx.Done():
+			printer.Println()
+			return
+		case <-ticker.C:
+			dirs := atomic.LoadInt64(&stats.TotalDirs)
+			files := atomic.LoadInt64(&stats.TotalFiles)
+			total := dirs + files
+			rate := float64(total-prevObjects) / interval.Seconds()
+			prevObjects = total
+
+			printer.PrintProgress(formatAvroProgress(stats, time.Since(start), int64(rate)))
+		}
+	}
+}
+
+func formatAvroProgress(stats *AvroStats, elapsed time.Duration, rate int64) string {
+	if stats == nil {
+		return fmt.Sprintf("[%s]", compactDuration(elapsed))
+	}
+
+	dirs := atomic.LoadInt64(&stats.TotalDirs)
+	files := atomic.LoadInt64(&stats.TotalFiles)
+	size := atomic.LoadInt64(&stats.TotalBytes)
+
+	return fmt.Sprintf("[%s] %s dirs • %s files • %s obj/s • %s",
+		compactDuration(elapsed),
+		humanSI(dirs),
+		humanSI(files),
+		humanSI(rate),
+		humanBytes(size),
+	)
 }
 
 func copyFileData(sourcePath, destinationPath string) error {
@@ -972,4 +1038,43 @@ func recordBufferSize(workers int) int {
 	default:
 		return bufferSize
 	}
+}
+
+func compactDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	switch {
+	case h > 0:
+		return fmt.Sprintf("%dh%dm%ds", h, m, s)
+	case m > 0:
+		return fmt.Sprintf("%dm%ds", m, s)
+	default:
+		return fmt.Sprintf("%ds", s)
+	}
+}
+
+func humanSI(n int64) string {
+	switch {
+	case n < 1_000:
+		return fmt.Sprintf("%d", n)
+	case n < 1_000_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	default:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	}
+}
+
+func humanBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
