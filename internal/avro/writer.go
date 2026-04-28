@@ -190,6 +190,8 @@ func writeFiles(tmpDir, incomingDir, baseName string, rows <-chan Record) (err e
 			"mtime_unix_ns": row.MTimeUnixNs,
 			"ctime_unix_ns": row.CTimeUnixNs,
 			"mode":          row.Mode,
+			"uid":           row.UID,
+			"gid":           row.GID,
 		})
 		if len(batchRows) == cap(batchRows) {
 			if err := flush(); err != nil {

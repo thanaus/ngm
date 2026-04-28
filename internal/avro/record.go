@@ -20,4 +20,6 @@ type Record struct {
 	MTimeUnixNs int64
 	CTimeUnixNs int64
 	Mode        int64
+	UID         int64
+	GID         int64
 }

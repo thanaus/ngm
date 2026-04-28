@@ -80,6 +80,35 @@ type profiler struct {
 	traceFile *os.File
 }
 
+type fileChangeSet struct {
+	Missing   bool
+	Size      bool
+	MTime     bool
+	Perm      bool
+	Owner     bool
+	Group     bool
+	XAttrSync bool
+}
+
+type fileActionPlan struct {
+	CopyData      bool
+	ApplyIdentity bool
+	CopyXAttrs    bool
+}
+
+type directoryChangeSet struct {
+	Missing bool
+	MTime   bool
+	Perm    bool
+	Owner   bool
+	Group   bool
+}
+
+type directoryActionPlan struct {
+	ApplyIdentity bool
+	CopyXAttrs    bool
+}
+
 type decisionLogger struct {
 	mu     sync.Mutex
 	file   *os.File
@@ -742,45 +771,43 @@ func processDirectoryRecord(ctx CopyContext, state *workerState, record avro.Rec
 	sourcePath := ctx.sourcePathFor(record.Path)
 	destinationPath := ctx.destinationPathFor(record.Path)
 
-	sourceInfo, err := os.Lstat(sourcePath)
-	if err != nil {
-		return fmt.Errorf("could not stat source directory %q: %w", sourcePath, err)
-	}
-	if !sourceInfo.IsDir() {
-		return fmt.Errorf("source path %q is not a directory", sourcePath)
-	}
-
-	metadata, err := readSourceDirectoryMetadata(sourcePath, sourceInfo, record)
-	if err != nil {
-		return err
-	}
-
 	destinationInfo, err := os.Stat(destinationPath)
 	switch {
 	case err == nil:
 		if !destinationInfo.IsDir() {
 			return fmt.Errorf("destination path %q is not a directory", destinationPath)
 		}
-		matches, err := directoryMetadataMatches(destinationPath, destinationInfo, metadata, record)
+		changes, err := compareDirectoryRecord(record, destinationInfo)
 		if err != nil {
 			return err
 		}
-		if matches {
-			if stats != nil {
-				atomic.AddInt64(&stats.TotalDirs, 1)
+		plan := buildDirectoryActionPlan(changes)
+		itemized := directoryChangeCode(changes)
+		if plan.ApplyIdentity {
+			if err := applyRecordedDirectoryIdentity(destinationPath, destinationInfo, record, changes); err != nil {
+				return err
 			}
-			return ctx.logDecision(".d.........", record.Path, true)
 		}
+		if err := copySourceDirectoryXAttrs(sourcePath, destinationPath); err != nil {
+			return err
+		}
+		if stats != nil {
+			atomic.AddInt64(&stats.TotalDirs, 1)
+		}
+		return ctx.logDecision(itemized, record.Path, true)
 	case os.IsNotExist(err):
 		if err := ensureParentDirectory(state, destinationPath); err != nil {
 			return err
 		}
-		if err := os.Mkdir(destinationPath, metadata.Mode.Perm()); err != nil {
+		if err := os.Mkdir(destinationPath, comparableMode(os.FileMode(record.Mode)).Perm()); err != nil {
 			if !os.IsExist(err) {
 				return fmt.Errorf("could not create destination directory %q: %w", destinationPath, err)
 			}
 		}
-		if err := applyDirectoryMetadata(destinationPath, metadata); err != nil {
+		if err := applyCreatedDirectoryIdentity(destinationPath, record); err != nil {
+			return err
+		}
+		if err := copySourceDirectoryXAttrs(sourcePath, destinationPath); err != nil {
 			return err
 		}
 		if stats != nil {
@@ -790,25 +817,6 @@ func processDirectoryRecord(ctx CopyContext, state *workerState, record avro.Rec
 	default:
 		return fmt.Errorf("could not stat destination directory %q: %w", destinationPath, err)
 	}
-
-	if err := ensureParentDirectory(state, destinationPath); err != nil {
-		return err
-	}
-
-	if err := os.Mkdir(destinationPath, metadata.Mode.Perm()); err != nil {
-		if !os.IsExist(err) {
-			return fmt.Errorf("could not create destination directory %q: %w", destinationPath, err)
-		}
-	}
-
-	if err := applyDirectoryMetadata(destinationPath, metadata); err != nil {
-		return err
-	}
-
-	if stats != nil {
-		atomic.AddInt64(&stats.TotalDirs, 1)
-	}
-	return ctx.logDecision(">d...pogua.", record.Path, true)
 }
 
 func ensureParentDirectory(state *workerState, destinationPath string) error {
@@ -860,9 +868,14 @@ func processFileRecord(ctx CopyContext, state *workerState, record avro.Record, 
 		}
 	}
 
-	sameSize := destinationInfo.Size() == record.Size
-	sameMTime := destinationInfo.ModTime().UnixNano() == record.MTimeUnixNs
-	if !sameSize || !sameMTime {
+	changes, err := compareFileRecord(record, destinationInfo)
+	if err != nil {
+		return err
+	}
+	plan := buildFileActionPlan(changes)
+	itemized := fileChangeCode(changes)
+
+	if plan.CopyData {
 		if err := copyFileData(sourcePath, destinationPath); err != nil {
 			return err
 		}
@@ -877,33 +890,24 @@ func processFileRecord(ctx CopyContext, state *workerState, record avro.Record, 
 			atomic.AddInt64(&stats.TotalFiles, 1)
 			atomic.AddInt64(&stats.TotalBytes, record.Size)
 		}
-		return ctx.logDecision(fileChangeCode(sameSize, sameMTime), record.Path, false)
+		return ctx.logDecision(itemized, record.Path, false)
 	}
 
-	destinationCTime, err := ctimeUnixNs(destinationInfo)
-	if err != nil {
-		return err
-	}
-	if destinationCTime >= record.CTimeUnixNs {
-		if stats != nil {
-			atomic.AddInt64(&stats.TotalFiles, 1)
-			atomic.AddInt64(&stats.TotalBytes, record.Size)
+	if plan.ApplyIdentity {
+		if err := applyRecordedFileIdentity(destinationPath, record, changes); err != nil {
+			return err
 		}
-		return ctx.logDecision(".f.........", record.Path, false)
 	}
-
-	metadata, err := readSourceFileMetadata(sourcePath, record)
-	if err != nil {
-		return err
-	}
-	if err := applyFileMetadata(destinationPath, metadata); err != nil {
-		return err
+	if plan.CopyXAttrs {
+		if err := copySourceFileXAttrs(sourcePath, destinationPath); err != nil {
+			return err
+		}
 	}
 	if stats != nil {
 		atomic.AddInt64(&stats.TotalFiles, 1)
 		atomic.AddInt64(&stats.TotalBytes, record.Size)
 	}
-	return ctx.logDecision(">f...pogua.", record.Path, false)
+	return ctx.logDecision(itemized, record.Path, false)
 }
 
 func processOtherRecord(ctx CopyContext, record avro.Record, stats *AvroStats) error {
@@ -926,17 +930,217 @@ func processOtherRecord(ctx CopyContext, record avro.Record, stats *AvroStats) e
 	}
 }
 
-func fileChangeCode(sameSize, sameMTime bool) string {
-	switch {
-	case !sameSize && !sameMTime:
-		return ">f.st......"
-	case !sameSize:
-		return ">f.s......."
-	case !sameMTime:
-		return ">f..t......"
-	default:
-		return ".f........."
+func compareFileRecord(record avro.Record, destinationInfo os.FileInfo) (fileChangeSet, error) {
+	stat, ok := destinationInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fileChangeSet{}, fmt.Errorf("unexpected stat type for %q", destinationInfo.Name())
 	}
+
+	destinationCTime, err := ctimeUnixNs(destinationInfo)
+	if err != nil {
+		return fileChangeSet{}, err
+	}
+
+	return fileChangeSet{
+		Size:      destinationInfo.Size() != record.Size,
+		MTime:     destinationInfo.ModTime().UnixNano() != record.MTimeUnixNs,
+		Perm:      comparableMode(destinationInfo.Mode()) != comparableMode(os.FileMode(record.Mode)),
+		Owner:     int64(stat.Uid) != record.UID,
+		Group:     int64(stat.Gid) != record.GID,
+		XAttrSync: destinationCTime < record.CTimeUnixNs,
+	}, nil
+}
+
+func compareDirectoryRecord(record avro.Record, destinationInfo os.FileInfo) (directoryChangeSet, error) {
+	stat, ok := destinationInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return directoryChangeSet{}, fmt.Errorf("unexpected stat type for %q", destinationInfo.Name())
+	}
+
+	return directoryChangeSet{
+		MTime: destinationInfo.ModTime().UnixNano() != record.MTimeUnixNs,
+		Perm:  comparableMode(destinationInfo.Mode()) != comparableMode(os.FileMode(record.Mode)),
+		Owner: int64(stat.Uid) != record.UID,
+		Group: int64(stat.Gid) != record.GID,
+	}, nil
+}
+
+func buildFileActionPlan(changes fileChangeSet) fileActionPlan {
+	copyData := changes.Missing || changes.Size || changes.MTime
+	return fileActionPlan{
+		CopyData:      copyData,
+		ApplyIdentity: copyData || changes.Perm || changes.Owner || changes.Group,
+		CopyXAttrs:    copyData || changes.XAttrSync,
+	}
+}
+
+func buildDirectoryActionPlan(changes directoryChangeSet) directoryActionPlan {
+	return directoryActionPlan{
+		ApplyIdentity: changes.MTime || changes.Perm || changes.Owner || changes.Group,
+		CopyXAttrs:    true,
+	}
+}
+
+func fileChangeCode(changes fileChangeSet) string {
+	if changes.Missing {
+		return ">f+++++++++"
+	}
+
+	code := []byte(".f.........")
+	if hasFileChanges(changes) {
+		code[0] = '>'
+	}
+	if changes.Size {
+		code[3] = 's'
+	}
+	if changes.MTime {
+		code[4] = 't'
+	}
+	if changes.Perm {
+		code[5] = 'p'
+	}
+	if changes.Owner {
+		code[6] = 'o'
+	}
+	if changes.Group {
+		code[7] = 'g'
+	}
+	if changes.XAttrSync {
+		code[8] = 'u'
+		code[9] = 'a'
+	}
+	return string(code)
+}
+
+func directoryChangeCode(changes directoryChangeSet) string {
+	if changes.Missing {
+		return ">d+++++++++"
+	}
+
+	code := []byte(".d.........")
+	if hasDirectoryChanges(changes) {
+		code[0] = '>'
+	}
+	if changes.MTime {
+		code[4] = 't'
+	}
+	if changes.Perm {
+		code[5] = 'p'
+	}
+	if changes.Owner {
+		code[6] = 'o'
+	}
+	if changes.Group {
+		code[7] = 'g'
+	}
+	code[8] = 'u'
+	code[9] = 'a'
+	return string(code)
+}
+
+func hasFileChanges(changes fileChangeSet) bool {
+	return changes.Missing ||
+		changes.Size ||
+		changes.MTime ||
+		changes.Perm ||
+		changes.Owner ||
+		changes.Group ||
+		changes.XAttrSync
+}
+
+func hasDirectoryChanges(changes directoryChangeSet) bool {
+	return true
+}
+
+func comparableMode(mode os.FileMode) os.FileMode {
+	return mode.Perm() | (mode & (os.ModeSetuid | os.ModeSetgid | os.ModeSticky))
+}
+
+func applyRecordedFileIdentity(destinationPath string, record avro.Record, changes fileChangeSet) error {
+	if changes.Perm {
+		mode := comparableMode(os.FileMode(record.Mode))
+		if err := os.Chmod(destinationPath, mode); err != nil {
+			return fmt.Errorf("could not chmod destination file %q: %w", destinationPath, err)
+		}
+	}
+
+	if changes.Owner || changes.Group {
+		if err := os.Chown(destinationPath, int(record.UID), int(record.GID)); err != nil {
+			return fmt.Errorf("could not chown destination file %q: %w", destinationPath, err)
+		}
+	}
+
+	return nil
+}
+
+func applyRecordedDirectoryIdentity(destinationPath string, destinationInfo os.FileInfo, record avro.Record, changes directoryChangeSet) error {
+	if changes.Perm {
+		mode := comparableMode(os.FileMode(record.Mode))
+		if err := os.Chmod(destinationPath, mode); err != nil {
+			return fmt.Errorf("could not chmod destination directory %q: %w", destinationPath, err)
+		}
+	}
+
+	if changes.Owner || changes.Group {
+		if err := os.Chown(destinationPath, int(record.UID), int(record.GID)); err != nil {
+			return fmt.Errorf("could not chown destination directory %q: %w", destinationPath, err)
+		}
+	}
+
+	if changes.MTime {
+		atime, err := atimeFromInfo(destinationInfo)
+		if err != nil {
+			return err
+		}
+		mtime := time.Unix(0, record.MTimeUnixNs)
+		if err := os.Chtimes(destinationPath, atime, mtime); err != nil {
+			return fmt.Errorf("could not chtimes destination directory %q: %w", destinationPath, err)
+		}
+	}
+
+	return nil
+}
+
+func applyCreatedDirectoryIdentity(destinationPath string, record avro.Record) error {
+	mode := comparableMode(os.FileMode(record.Mode))
+	if err := os.Chmod(destinationPath, mode); err != nil {
+		return fmt.Errorf("could not chmod destination directory %q: %w", destinationPath, err)
+	}
+
+	if err := os.Chown(destinationPath, int(record.UID), int(record.GID)); err != nil {
+		return fmt.Errorf("could not chown destination directory %q: %w", destinationPath, err)
+	}
+
+	mtime := time.Unix(0, record.MTimeUnixNs)
+	if err := os.Chtimes(destinationPath, mtime, mtime); err != nil {
+		return fmt.Errorf("could not chtimes destination directory %q: %w", destinationPath, err)
+	}
+
+	return nil
+}
+
+func copySourceFileXAttrs(sourcePath, destinationPath string) error {
+	xattrs, err := readPathXattrs(sourcePath)
+	if err != nil {
+		return err
+	}
+	return copyPathXattrs(destinationPath, xattrs)
+}
+
+func copySourceDirectoryXAttrs(sourcePath, destinationPath string) error {
+	xattrs, err := readPathXattrs(sourcePath)
+	if err != nil {
+		return err
+	}
+	return copyPathXattrs(destinationPath, xattrs)
+}
+
+func atimeFromInfo(info os.FileInfo) (time.Time, error) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return time.Time{}, fmt.Errorf("unexpected stat type for %q", info.Name())
+	}
+	return time.Unix(stat.Atim.Sec, stat.Atim.Nsec), nil
 }
 
 func printCopySummaryLegacy(ctx CopyContext, start time.Time, stats *AvroStats, errorCount int64) {

@@ -9,6 +9,8 @@ const objectRecordSchema = `{
     {"name": "size", "type": "long"},
     {"name": "mtime_unix_ns", "type": "long"},
     {"name": "ctime_unix_ns", "type": "long"},
-    {"name": "mode", "type": "long"}
+    {"name": "mode", "type": "long"},
+    {"name": "uid", "type": "long"},
+    {"name": "gid", "type": "long"}
   ]
 }`

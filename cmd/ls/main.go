@@ -536,6 +536,8 @@ func fillRecordFromInfo(record *avro.Record, info os.FileInfo) {
 	record.MTimeUnixNs = info.ModTime().UnixNano()
 	record.CTimeUnixNs = ctimeUnixNs(info)
 	record.Mode = int64(info.Mode())
+	record.UID = uidFromInfo(info)
+	record.GID = gidFromInfo(info)
 }
 
 func entryTypeFromMode(mode os.FileMode) avro.EntryType {
@@ -565,6 +567,22 @@ func ctimeUnixNs(info os.FileInfo) int64 {
 		return 0
 	}
 	return stat.Ctim.Sec*1_000_000_000 + stat.Ctim.Nsec
+}
+
+func uidFromInfo(info os.FileInfo) int64 {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0
+	}
+	return int64(stat.Uid)
+}
+
+func gidFromInfo(info os.FileInfo) int64 {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0
+	}
+	return int64(stat.Gid)
 }
 
 func humanSI(n int64) string {

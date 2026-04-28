@@ -70,6 +70,16 @@ func ReadRecords(ctx context.Context, path string, records chan<- Record) error 
 			return err
 		}
 
+		uidValue, err := getInt64Field(record, "uid")
+		if err != nil {
+			return err
+		}
+
+		gidValue, err := getInt64Field(record, "gid")
+		if err != nil {
+			return err
+		}
+
 		recordValue := Record{
 			Path:        pathValue,
 			Type:        EntryType(entryTypeValue),
@@ -77,6 +87,8 @@ func ReadRecords(ctx context.Context, path string, records chan<- Record) error 
 			MTimeUnixNs: mtimeValue,
 			CTimeUnixNs: ctimeValue,
 			Mode:        modeValue,
+			UID:         uidValue,
+			GID:         gidValue,
 		}
 
 		select {
