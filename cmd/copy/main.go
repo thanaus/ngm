@@ -8,37 +8,19 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
-	"strings"
+	"runtime"
+	"runtime/pprof"
+	"runtime/trace"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/linkedin/goavro/v2"
+	"nexus-ls/internal/avro"
+
 	"github.com/spf13/cobra"
-)
-
-type CopyRecord struct {
-	Path        string
-	EntryType   int32
-	Size        int64
-	MTimeUnixNs int64
-	CTimeUnixNs int64
-	Mode        int64
-}
-
-type EntryType int32
-
-const (
-	TypeUnknown EntryType = iota
-	TypeFile
-	TypeDir
-	TypeSymlink
-	TypeCharDev
-	TypeDevice
-	TypePipe
-	TypeSocket
 )
 
 type CopyContext struct {
@@ -65,6 +47,15 @@ type AvroStats struct {
 	TotalBytes  int64
 }
 
+type ProfileConfig struct {
+	CPUProfile       string
+	MemProfile       string
+	BlockProfile     string
+	MutexProfile     string
+	GoroutineProfile string
+	TraceFile        string
+}
+
 const ensuredParentCacheSize = 128
 const incomingPollInterval = 10 * time.Second
 
@@ -76,6 +67,13 @@ type recentPathSet struct {
 	capacity int
 	paths    []string
 	index    map[string]int
+}
+
+type profiler struct {
+	cfg       ProfileConfig
+	printer   *stderrPrinter
+	cpuFile   *os.File
+	traceFile *os.File
 }
 
 type stderrPrinter struct {
@@ -202,8 +200,14 @@ func (ctx CopyContext) destinationPathFor(recordPath string) string {
 
 func main() {
 	var (
-		avroDir string
-		workers int
+		avroDir          string
+		workers          int
+		cpuProfile       string
+		memProfile       string
+		blockProfile     string
+		mutexProfile     string
+		goroutineProfile string
+		traceFile        string
 	)
 
 	rootCmd := &cobra.Command{
@@ -238,11 +242,24 @@ This is only a skeleton for now and the actual copy logic will be added later.`,
 				DestinationDir: destinationDir,
 				AvroDir:        avroDir,
 				Workers:        workers,
+			}, ProfileConfig{
+				CPUProfile:       cpuProfile,
+				MemProfile:       memProfile,
+				BlockProfile:     blockProfile,
+				MutexProfile:     mutexProfile,
+				GoroutineProfile: goroutineProfile,
+				TraceFile:        traceFile,
 			})
 		},
 	}
 
 	rootCmd.Flags().IntVarP(&workers, "jobs", "j", 4, "Number of parallel workers")
+	rootCmd.Flags().StringVarP(&cpuProfile, "cpuprofile", "p", "", "Write CPU profile to this file")
+	rootCmd.Flags().StringVar(&memProfile, "memprofile", "", "Write heap profile to this file")
+	rootCmd.Flags().StringVar(&blockProfile, "blockprofile", "", "Write blocking profile to this file")
+	rootCmd.Flags().StringVar(&mutexProfile, "mutexprofile", "", "Write mutex profile to this file")
+	rootCmd.Flags().StringVar(&goroutineProfile, "goroutineprofile", "", "Write goroutine profile to this file")
+	rootCmd.Flags().StringVar(&traceFile, "trace", "", "Write execution trace to this file")
 	rootCmd.Flags().StringVar(
 		&avroDir,
 		"avro-dir",
@@ -255,9 +272,23 @@ This is only a skeleton for now and the actual copy logic will be added later.`,
 	}
 }
 
-func run(ctx CopyContext) error {
+func run(ctx CopyContext, profileCfg ProfileConfig) (err error) {
+	runCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	printer := &stderrPrinter{}
+	profiler, err := startProfiler(profileCfg, printer)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if stopErr := profiler.Stop(); stopErr != nil && err == nil {
+			err = stopErr
+		}
+	}()
+
 	if ctx.AvroDir != "" {
-		return processIncomingAvroFiles(ctx)
+		return processIncomingAvroFiles(runCtx, ctx)
 	}
 	fmt.Println()
 	fmt.Println("Copy skeleton ready. Actual copy logic is not implemented yet.")
@@ -283,62 +314,30 @@ func validateDestinationDir(path string) error {
 }
 
 func validateAvroDir(path string) error {
-	if path == "" {
-		return nil
-	}
-
-	info, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("could not access avro directory %q: %w", path, err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("avro path %q is not a directory", path)
-	}
-
-	if err := requireDir(filepath.Join(path, "tmp")); err != nil {
-		return fmt.Errorf("invalid avro directory: %w", err)
-	}
-	if err := requireDir(filepath.Join(path, "incoming")); err != nil {
-		return fmt.Errorf("invalid avro directory: %w", err)
-	}
-	if err := requireDir(filepath.Join(path, "processing")); err != nil {
-		return fmt.Errorf("invalid avro directory: %w", err)
-	}
-	if err := requireDir(filepath.Join(path, "done")); err != nil {
-		return fmt.Errorf("invalid avro directory: %w", err)
-	}
-	if err := requireDir(filepath.Join(path, "error")); err != nil {
-		return fmt.Errorf("invalid avro directory: %w", err)
-	}
-
-	return nil
+	return avro.ValidateDir(path)
 }
 
-func requireDir(path string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("required directory %q is missing or inaccessible: %w", path, err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("required path %q is not a directory", path)
-	}
-	return nil
-}
-
-func processIncomingAvroFiles(ctx CopyContext) error {
-	incomingDir := filepath.Join(ctx.AvroDir, "incoming")
+func processIncomingAvroFiles(runCtx context.Context, ctx CopyContext) error {
 	totalStart := time.Now()
 	var totalStats AvroStats
 	var totalErrors int64
 	totalPrinted := false
 
+scanLoop:
 	for {
-		selectedName, hasDone, err := nextIncomingFile(incomingDir)
-		if err != nil {
-			return fmt.Errorf("could not read incoming directory %q: %w", incomingDir, err)
+		if runCtx.Err() != nil {
+			break
 		}
-		if selectedName != "" {
-			shardStats, shardErrorCount, _, fatalErr := processOneIncomingAvroFile(ctx, selectedName)
+
+		claim, hasDone, err := avro.ClaimNextIncomingFile(ctx.AvroDir)
+		if err != nil {
+			if runCtx.Err() != nil {
+				break
+			}
+			return err
+		}
+		if claim != nil {
+			shardStats, shardErrorCount, processErr, fatalErr := processOneIncomingAvroFile(runCtx, ctx, claim)
 			if fatalErr != nil {
 				return fatalErr
 			}
@@ -349,6 +348,9 @@ func processIncomingAvroFiles(ctx CopyContext) error {
 			totalErrors += shardErrorCount
 			fmt.Printf("[total %s] %s\n\n", compactDuration(time.Since(totalStart)), formatAvroSummary(&totalStats))
 			totalPrinted = true
+			if errors.Is(processErr, context.Canceled) {
+				break
+			}
 			continue
 		}
 		if hasDone {
@@ -358,53 +360,30 @@ func processIncomingAvroFiles(ctx CopyContext) error {
 			printCopySummary(ctx, totalStart, &totalStats, totalErrors)
 			return nil
 		}
-		time.Sleep(incomingPollInterval)
+
+		timer := time.NewTimer(incomingPollInterval)
+		select {
+		case <-runCtx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			break scanLoop
+		case <-timer.C:
+		}
 	}
+
+	if !totalPrinted {
+		fmt.Printf("[total %s] %s\n", compactDuration(time.Since(totalStart)), formatAvroSummary(&totalStats))
+	}
+	printCopySummaryWithStatus(ctx, totalStart, &totalStats, totalErrors, true)
+	return nil
 }
 
-func nextIncomingFile(incomingDir string) (selectedName string, hasDone bool, err error) {
-	entries, err := os.ReadDir(incomingDir)
-	if err != nil {
-		return "", false, err
-	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		if entry.Name() == ".done" {
-			hasDone = true
-			continue
-		}
-		if selectedName == "" {
-			selectedName = entry.Name()
-		}
-	}
-	return selectedName, hasDone, nil
-}
-
-func processOneIncomingAvroFile(ctx CopyContext, selectedName string) (stats AvroStats, errorCount int64, processErr error, fatalErr error) {
-	hostname, err := os.Hostname()
-	if err != nil {
-		return stats, 0, nil, fmt.Errorf("could not determine hostname: %w", err)
-	}
-
-	incomingDir := filepath.Join(ctx.AvroDir, "incoming")
-	processingDir := filepath.Join(ctx.AvroDir, "processing")
-	doneDir := filepath.Join(ctx.AvroDir, "done")
-	errorDir := filepath.Join(ctx.AvroDir, "error")
-
-	sourcePath := filepath.Join(incomingDir, selectedName)
-	processingName := addProcessingSuffix(selectedName, hostname, os.Getpid())
-	processingPath := filepath.Join(processingDir, processingName)
-
-	if err := os.Rename(sourcePath, processingPath); err != nil {
-		return stats, 0, nil, fmt.Errorf("could not move %q to %q: %w", sourcePath, processingPath, err)
-	}
-
-	fmt.Printf("[start] %s\n", selectedName)
+func processOneIncomingAvroFile(runCtx context.Context, ctx CopyContext, claim *avro.ClaimedFile) (stats AvroStats, errorCount int64, processErr error, fatalErr error) {
+	fmt.Printf("[start] %s\n", claim.SelectedName)
 	start := time.Now()
 	printer := &stderrPrinter{}
-	progressCtx, cancelProgress := context.WithCancel(context.Background())
+	progressCtx, cancelProgress := context.WithCancel(runCtx)
 	var progressWg sync.WaitGroup
 	progressWg.Add(1)
 	go func() {
@@ -412,24 +391,17 @@ func processOneIncomingAvroFile(ctx CopyContext, selectedName string) (stats Avr
 		reportAvroProgress(progressCtx, printer, &stats, start)
 	}()
 
-	processErr, errorCount = processAvroPaths(ctx, processingPath, &stats, &workerErrorSink{
+	processErr, errorCount = processAvroPaths(runCtx, ctx, claim.ProcessingPath, &stats, &workerErrorSink{
 		logf: func(err error) {
-			printer.Logf("[error] processing %q: %v", selectedName, err)
+			printer.Logf("[error] processing %q: %v", claim.SelectedName, err)
 		},
 	})
 	cancelProgress()
 	progressWg.Wait()
 
-	targetDir := doneDir
-	targetLabel := "done"
-	if processErr != nil {
-		targetDir = errorDir
-		targetLabel = "error"
-	}
-
-	finalPath := filepath.Join(targetDir, filepath.Base(processingPath))
-	if err := os.Rename(processingPath, finalPath); err != nil {
-		moveErr := fmt.Errorf("could not move %q to %q: %w", processingPath, finalPath, err)
+	targetLabel, err := avro.FinalizeClaim(ctx.AvroDir, claim, processErr != nil)
+	if err != nil {
+		moveErr := err
 		errorCount++
 		if processErr != nil {
 			return stats, errorCount, nil, errors.Join(processErr, moveErr)
@@ -441,17 +413,8 @@ func processOneIncomingAvroFile(ctx CopyContext, selectedName string) (stats Avr
 	return stats, errorCount, processErr, nil
 }
 
-func addProcessingSuffix(name, hostname string, pid int) string {
-	ext := filepath.Ext(name)
-	base := strings.TrimSuffix(name, ext)
-	if ext == "" {
-		return fmt.Sprintf("%s.%s.%d", base, hostname, pid)
-	}
-	return fmt.Sprintf("%s.%s.%d%s", base, hostname, pid, ext)
-}
-
-func processAvroPaths(ctx CopyContext, path string, stats *AvroStats, workerErrors *workerErrorSink) (error, int64) {
-	records := make(chan CopyRecord, recordBufferSize(ctx.Workers))
+func processAvroPaths(runCtx context.Context, ctx CopyContext, path string, stats *AvroStats, workerErrors *workerErrorSink) (error, int64) {
+	records := make(chan avro.Record, recordBufferSize(ctx.Workers))
 	var wg sync.WaitGroup
 
 	if workerErrors == nil {
@@ -462,16 +425,22 @@ func processAvroPaths(ctx CopyContext, path string, stats *AvroStats, workerErro
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			copyWorker(ctx, newWorkerState(), records, stats, workerErrors)
+			copyWorker(runCtx, ctx, newWorkerState(), records, stats, workerErrors)
 		}()
 	}
 
-	readErr := readAvroRecords(path, records)
+	readErr := avro.ReadRecords(runCtx, path, records)
 	close(records)
 	wg.Wait()
 	errorCount := workerErrors.errorCount()
-	if readErr != nil {
+	if readErr != nil && !errors.Is(readErr, context.Canceled) {
 		errorCount++
+	}
+	if errors.Is(readErr, context.Canceled) {
+		if workerErrors.err != nil {
+			return errors.Join(runCtx.Err(), workerErrors.err), errorCount
+		}
+		return runCtx.Err(), errorCount
 	}
 
 	if readErr != nil && workerErrors.err != nil {
@@ -483,26 +452,202 @@ func processAvroPaths(ctx CopyContext, path string, stats *AvroStats, workerErro
 	return workerErrors.err, errorCount
 }
 
-func copyWorker(ctx CopyContext, state *workerState, records <-chan CopyRecord, stats *AvroStats, workerErrors *workerErrorSink) {
-	for record := range records {
-		if err := processRecord(ctx, state, record, stats); err != nil {
-			workerErrors.set(err)
+func copyWorker(runCtx context.Context, ctx CopyContext, state *workerState, records <-chan avro.Record, stats *AvroStats, workerErrors *workerErrorSink) {
+	for {
+		select {
+		case <-runCtx.Done():
+			return
+		case record, ok := <-records:
+			if !ok {
+				return
+			}
+			if err := processRecord(ctx, state, record, stats); err != nil {
+				workerErrors.set(err)
+			}
 		}
 	}
 }
 
-func processRecord(ctx CopyContext, state *workerState, record CopyRecord, stats *AvroStats) error {
-	switch EntryType(record.EntryType) {
-	case TypeDir:
+func startProfiler(cfg ProfileConfig, printer *stderrPrinter) (*profiler, error) {
+	p := &profiler{
+		cfg:     cfg,
+		printer: printer,
+	}
+
+	if cfg.BlockProfile != "" {
+		runtime.SetBlockProfileRate(1)
+	}
+	if cfg.MutexProfile != "" {
+		runtime.SetMutexProfileFraction(1)
+	}
+
+	if cfg.CPUProfile != "" {
+		f, err := os.Create(cfg.CPUProfile)
+		if err != nil {
+			runtime.SetBlockProfileRate(0)
+			runtime.SetMutexProfileFraction(0)
+			return nil, fmt.Errorf("could not create CPU profile %q: %w", cfg.CPUProfile, err)
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			_ = f.Close()
+			runtime.SetBlockProfileRate(0)
+			runtime.SetMutexProfileFraction(0)
+			return nil, fmt.Errorf("could not start CPU profile %q: %w", cfg.CPUProfile, err)
+		}
+		p.cpuFile = f
+	}
+
+	if cfg.TraceFile != "" {
+		f, err := os.Create(cfg.TraceFile)
+		if err != nil {
+			_ = p.Stop()
+			return nil, fmt.Errorf("could not create trace file %q: %w", cfg.TraceFile, err)
+		}
+		if err := trace.Start(f); err != nil {
+			_ = f.Close()
+			_ = p.Stop()
+			return nil, fmt.Errorf("could not start trace %q: %w", cfg.TraceFile, err)
+		}
+		p.traceFile = f
+	}
+
+	return p, nil
+}
+
+func (p *profiler) Stop() error {
+	if p == nil {
+		return nil
+	}
+
+	var errs []error
+
+	if p.traceFile != nil {
+		trace.Stop()
+		if err := p.traceFile.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("could not close trace file %q: %w", p.cfg.TraceFile, err))
+		} else {
+			p.logf("[profile] wrote trace profile to %q", p.cfg.TraceFile)
+		}
+		p.traceFile = nil
+	}
+
+	if p.cpuFile != nil {
+		pprof.StopCPUProfile()
+		if err := p.cpuFile.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("could not close CPU profile %q: %w", p.cfg.CPUProfile, err))
+		} else {
+			p.logf("[profile] wrote CPU profile to %q", p.cfg.CPUProfile)
+		}
+		p.cpuFile = nil
+	}
+
+	if p.cfg.MemProfile != "" {
+		runtime.GC()
+		f, err := os.Create(p.cfg.MemProfile)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("could not create memory profile %q: %w", p.cfg.MemProfile, err))
+		} else {
+			if err := pprof.WriteHeapProfile(f); err != nil {
+				errs = append(errs, fmt.Errorf("could not write memory profile %q: %w", p.cfg.MemProfile, err))
+			} else {
+				p.logf("[profile] wrote memory profile to %q", p.cfg.MemProfile)
+			}
+			if err := f.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("could not close memory profile %q: %w", p.cfg.MemProfile, err))
+			}
+		}
+	}
+
+	if err := p.writeNamedProfile("block", p.cfg.BlockProfile); err != nil {
+		errs = append(errs, err)
+	}
+	if err := p.writeNamedProfile("mutex", p.cfg.MutexProfile); err != nil {
+		errs = append(errs, err)
+	}
+	if err := p.writeNamedProfile("goroutine", p.cfg.GoroutineProfile); err != nil {
+		errs = append(errs, err)
+	}
+
+	runtime.SetBlockProfileRate(0)
+	runtime.SetMutexProfileFraction(0)
+
+	return errors.Join(errs...)
+}
+
+func (p *profiler) writeNamedProfile(name, path string) error {
+	if path == "" {
+		return nil
+	}
+
+	profile := pprof.Lookup(name)
+	if profile == nil {
+		return fmt.Errorf("profile %q is not available", name)
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("could not create %s profile %q: %w", name, path, err)
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	if err := profile.WriteTo(f, 0); err != nil {
+		return fmt.Errorf("could not write %s profile %q: %w", name, path, err)
+	}
+	p.logf("[profile] wrote %s profile to %q", name, path)
+	return nil
+}
+
+func (p *profiler) logf(format string, args ...any) {
+	if p != nil && p.printer != nil {
+		p.printer.Logf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
+}
+
+func printCopySummaryWithStatus(ctx CopyContext, start time.Time, stats *AvroStats, errorCount int64, interrupted bool) {
+	elapsed := time.Since(start)
+	dirs := atomic.LoadInt64(&stats.TotalDirs)
+	files := atomic.LoadInt64(&stats.TotalFiles)
+	others := atomic.LoadInt64(&stats.TotalOthers)
+	rate := float64(dirs+files) / elapsed.Seconds()
+
+	status := "Copie complete"
+	if interrupted {
+		status = "Copie interrompue"
+	}
+
+	fmt.Printf("\n%s\n\n", status)
+	fmt.Printf("%-18s%s\n", "Source Path", ctx.SourceDir)
+	fmt.Printf("%-18s%s\n", "Destination Path", ctx.DestinationDir)
+	fmt.Printf("%-18s%s • %s obj/s\n\n", "Duration", compactDuration(elapsed), humanSI(int64(rate)))
+	fmt.Printf("%-18s%s dirs • %s files • %s others\n", "Entries",
+		humanSI(dirs),
+		humanSI(files),
+		humanSI(others),
+	)
+	fmt.Printf("%-18s%s\n", "Total size", humanBytes(atomic.LoadInt64(&stats.TotalBytes)))
+	fmt.Printf("%-18s%d\n\n", "Errors", errorCount)
+}
+
+func printCopySummary(ctx CopyContext, start time.Time, stats *AvroStats, errorCount int64) {
+	printCopySummaryWithStatus(ctx, start, stats, errorCount, false)
+}
+
+func processRecord(ctx CopyContext, state *workerState, record avro.Record, stats *AvroStats) error {
+	switch record.Type {
+	case avro.TypeDir:
 		return processDirectoryRecord(ctx, state, record, stats)
-	case TypeFile:
+	case avro.TypeFile:
 		return processFileRecord(ctx, state, record, stats)
 	default:
 		return processOtherRecord(ctx, record, stats)
 	}
 }
 
-func processDirectoryRecord(ctx CopyContext, state *workerState, record CopyRecord, stats *AvroStats) error {
+func processDirectoryRecord(ctx CopyContext, state *workerState, record avro.Record, stats *AvroStats) error {
 	sourcePath := ctx.sourcePathFor(record.Path)
 	destinationPath := ctx.destinationPathFor(record.Path)
 
@@ -578,7 +723,7 @@ func ensureParentDirectory(state *workerState, destinationPath string) error {
 	return nil
 }
 
-func processFileRecord(ctx CopyContext, state *workerState, record CopyRecord, stats *AvroStats) error {
+func processFileRecord(ctx CopyContext, state *workerState, record avro.Record, stats *AvroStats) error {
 	sourcePath := ctx.sourcePathFor(record.Path)
 	destinationPath := ctx.destinationPathFor(record.Path)
 
@@ -656,7 +801,7 @@ func processFileRecord(ctx CopyContext, state *workerState, record CopyRecord, s
 	return nil
 }
 
-func processOtherRecord(ctx CopyContext, record CopyRecord, stats *AvroStats) error {
+func processOtherRecord(ctx CopyContext, record avro.Record, stats *AvroStats) error {
 	destinationPath := ctx.destinationPathFor(record.Path)
 
 	_, err := os.Stat(destinationPath)
@@ -676,7 +821,7 @@ func processOtherRecord(ctx CopyContext, record CopyRecord, stats *AvroStats) er
 	}
 }
 
-func printCopySummary(ctx CopyContext, start time.Time, stats *AvroStats, errorCount int64) {
+func printCopySummaryLegacy(ctx CopyContext, start time.Time, stats *AvroStats, errorCount int64) {
 	elapsed := time.Since(start)
 	dirs := atomic.LoadInt64(&stats.TotalDirs)
 	files := atomic.LoadInt64(&stats.TotalFiles)
@@ -721,7 +866,7 @@ func applyDirectoryMetadata(destinationPath string, metadata DirectoryMetadata) 
 	return nil
 }
 
-func directoryMetadataMatches(destinationPath string, destinationInfo os.FileInfo, metadata DirectoryMetadata, record CopyRecord) (bool, error) {
+func directoryMetadataMatches(destinationPath string, destinationInfo os.FileInfo, metadata DirectoryMetadata, record avro.Record) (bool, error) {
 	expectedMode := metadata.Mode.Perm() | (metadata.Mode & (os.ModeSetuid | os.ModeSetgid | os.ModeSticky))
 	actualMode := destinationInfo.Mode().Perm() | (destinationInfo.Mode() & (os.ModeSetuid | os.ModeSetgid | os.ModeSticky))
 	if actualMode != expectedMode {
@@ -880,7 +1025,7 @@ func applyFileMetadata(destinationPath string, metadata DirectoryMetadata) error
 	return nil
 }
 
-func readSourceDirectoryMetadata(sourcePath string, sourceInfo os.FileInfo, record CopyRecord) (DirectoryMetadata, error) {
+func readSourceDirectoryMetadata(sourcePath string, sourceInfo os.FileInfo, record avro.Record) (DirectoryMetadata, error) {
 	stat, ok := sourceInfo.Sys().(*syscall.Stat_t)
 	if !ok {
 		return DirectoryMetadata{}, fmt.Errorf("unexpected stat type for %q", sourcePath)
@@ -907,7 +1052,7 @@ func readSourceDirectoryMetadata(sourcePath string, sourceInfo os.FileInfo, reco
 	}, nil
 }
 
-func readSourceFileMetadata(sourcePath string, record CopyRecord) (DirectoryMetadata, error) {
+func readSourceFileMetadata(sourcePath string, record avro.Record) (DirectoryMetadata, error) {
 	sourceInfo, err := os.Stat(sourcePath)
 	if err != nil {
 		return DirectoryMetadata{}, fmt.Errorf("could not stat source file %q: %w", sourcePath, err)
@@ -1008,107 +1153,6 @@ func splitXattrList(buffer []byte) []string {
 		names = append(names, string(buffer[start:]))
 	}
 	return names
-}
-
-func readAvroRecords(path string, records chan<- CopyRecord) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("could not open avro file %q: %w", path, err)
-	}
-	defer f.Close()
-
-	reader, err := goavro.NewOCFReader(f)
-	if err != nil {
-		return fmt.Errorf("could not create avro reader for %q: %w", path, err)
-	}
-
-	for reader.Scan() {
-		datum, err := reader.Read()
-		if err != nil {
-			return fmt.Errorf("could not read avro record from %q: %w", path, err)
-		}
-
-		record, ok := datum.(map[string]interface{})
-		if !ok {
-			return fmt.Errorf("unexpected avro record type %T", datum)
-		}
-
-		rawPath, ok := record["path"]
-		if !ok {
-			continue
-		}
-
-		pathValue, ok := rawPath.(string)
-		if !ok {
-			return fmt.Errorf("unexpected avro path type %T", rawPath)
-		}
-
-		entryTypeValue, err := getInt32Field(record, "entry_type")
-		if err != nil {
-			return err
-		}
-
-		sizeValue, err := getInt64Field(record, "size")
-		if err != nil {
-			return err
-		}
-
-		mtimeValue, err := getInt64Field(record, "mtime_unix_ns")
-		if err != nil {
-			return err
-		}
-
-		ctimeValue, err := getInt64Field(record, "ctime_unix_ns")
-		if err != nil {
-			return err
-		}
-
-		modeValue, err := getInt64Field(record, "mode")
-		if err != nil {
-			return err
-		}
-
-		records <- CopyRecord{
-			Path:        pathValue,
-			EntryType:   entryTypeValue,
-			Size:        sizeValue,
-			MTimeUnixNs: mtimeValue,
-			CTimeUnixNs: ctimeValue,
-			Mode:        modeValue,
-		}
-	}
-
-	return nil
-}
-
-func getInt32Field(record map[string]interface{}, field string) (int32, error) {
-	value, err := getInt64Field(record, field)
-	if err != nil {
-		return 0, err
-	}
-	return int32(value), nil
-}
-
-func getInt64Field(record map[string]interface{}, field string) (int64, error) {
-	rawValue, ok := record[field]
-	if !ok {
-		return 0, fmt.Errorf("missing avro field %q", field)
-	}
-
-	switch value := rawValue.(type) {
-	case int:
-		return int64(value), nil
-	case int32:
-		return int64(value), nil
-	case int64:
-		return value, nil
-	case float32:
-		return int64(value), nil
-	case float64:
-		return int64(value), nil
-	default:
-		return 0, fmt.Errorf("unexpected avro field %q type %T", field, rawValue)
-	}
 }
 
 func recordBufferSize(workers int) int {

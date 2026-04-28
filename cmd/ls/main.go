@@ -16,26 +16,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/linkedin/goavro/v2"
+	"nexus-ls/internal/avro"
+
 	"github.com/spf13/cobra"
 )
 
 var osSep = string([]byte{os.PathSeparator})
-
-type EntryType int32
-
-const (
-	TypeUnknown EntryType = iota
-	TypeFile
-	TypeDir
-	TypeSymlink
-	TypeCharDev
-	TypeDevice
-	TypePipe
-	TypeSocket
-)
-
-const avroMaxRecordsPerFile = 1_000_000
 
 type ScanResult struct {
 	TotalFiles  int64
@@ -48,21 +34,6 @@ type ScanResult struct {
 	ScanNs    int64
 	ReadDirNs int64
 	InfoNs    int64
-}
-
-type ObjectRecord struct {
-	Path        string
-	Type        EntryType
-	Size        int64
-	MTimeUnixNs int64
-	CTimeUnixNs int64
-	Mode        int64
-}
-
-type avroExport struct {
-	path string
-	rows chan ObjectRecord
-	errc chan error
 }
 
 type dirQueue struct {
@@ -227,17 +198,17 @@ func run(root string, workers int, noSize bool, batch int, cpuProfile, memProfil
 	q := newDirQueue(root)
 	var result ScanResult
 	var wg, reporterWg sync.WaitGroup
-	var exportRows chan ObjectRecord
+	var exportRows chan avro.Record
 	var exportPath string
 	var exportLabel string
 
-	avroExporter, err := startAvroExport(avroDir, workers, batch)
+	avroExporter, err := avro.StartExport(avroDir, workers, batch)
 	if err != nil {
 		return err
 	}
 	if avroExporter != nil {
-		exportRows = avroExporter.rows
-		exportPath = avroExporter.path
+		exportRows = avroExporter.Rows
+		exportPath = avroExporter.PathPattern()
 		exportLabel = "Avro"
 	}
 
@@ -259,18 +230,18 @@ func run(root string, workers int, noSize bool, batch int, cpuProfile, memProfil
 
 	interrupted := ctx.Err() != nil
 	if avroExporter != nil {
-		close(avroExporter.rows)
+		close(avroExporter.Rows)
 	}
 
 	cancel()
 	reporterWg.Wait()
 
 	if avroExporter != nil {
-		if err := avroExporter.wait(); err != nil {
+		if err := avroExporter.Wait(); err != nil {
 			return err
 		}
 	}
-	if err := writeDoneFile(avroDir); err != nil {
+	if err := avro.WriteDoneFile(avroDir); err != nil {
 		return err
 	}
 
@@ -375,7 +346,7 @@ func reportProgress(ctx context.Context, printer *stderrPrinter, result *ScanRes
 	}
 }
 
-func runWorker(ctx context.Context, q *dirQueue, printer *stderrPrinter, root string, result *ScanResult, noSize bool, batch int, exportRows chan<- ObjectRecord) {
+func runWorker(ctx context.Context, q *dirQueue, printer *stderrPrinter, root string, result *ScanResult, noSize bool, batch int, exportRows chan<- avro.Record) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -398,7 +369,7 @@ func runWorker(ctx context.Context, q *dirQueue, printer *stderrPrinter, root st
 	}
 }
 
-func scanDir(ctx context.Context, printer *stderrPrinter, root, dir string, result *ScanResult, noSize bool, batch int, exportRows chan<- ObjectRecord) []string {
+func scanDir(ctx context.Context, printer *stderrPrinter, root, dir string, result *ScanResult, noSize bool, batch int, exportRows chan<- avro.Record) []string {
 	f, err := os.Open(dir)
 	if err != nil {
 		printer.Logf("[error] open %q: %v", dir, err)
@@ -433,7 +404,7 @@ func scanDir(ctx context.Context, printer *stderrPrinter, root, dir string, resu
 			case entry.IsDir():
 				atomic.AddInt64(&result.TotalDirs, 1)
 				subdirs = append(subdirs, path)
-				record := ObjectRecord{Path: relativePath, Type: TypeDir}
+				record := avro.Record{Path: relativePath, Type: avro.TypeDir}
 				if infoErr == nil {
 					fillRecordFromInfo(&record, info)
 				}
@@ -443,7 +414,7 @@ func scanDir(ctx context.Context, printer *stderrPrinter, root, dir string, resu
 
 			case entry.Type().IsRegular():
 				atomic.AddInt64(&result.TotalFiles, 1)
-				record := ObjectRecord{Path: relativePath, Type: TypeFile}
+				record := avro.Record{Path: relativePath, Type: avro.TypeFile}
 				if infoErr == nil {
 					fillRecordFromInfo(&record, info)
 					atomic.AddInt64(&result.TotalBytes, record.Size)
@@ -454,7 +425,7 @@ func scanDir(ctx context.Context, printer *stderrPrinter, root, dir string, resu
 
 			default:
 				atomic.AddInt64(&result.TotalOthers, 1)
-				record := ObjectRecord{Path: relativePath, Type: entryTypeFromMode(entry.Type())}
+				record := avro.Record{Path: relativePath, Type: entryTypeFromMode(entry.Type())}
 				if infoErr == nil {
 					fillRecordFromInfo(&record, info)
 				}
@@ -475,7 +446,7 @@ func scanDir(ctx context.Context, printer *stderrPrinter, root, dir string, resu
 	return subdirs
 }
 
-func emitRecord(ctx context.Context, exportRows chan<- ObjectRecord, record ObjectRecord) bool {
+func emitRecord(ctx context.Context, exportRows chan<- avro.Record, record avro.Record) bool {
 	if exportRows == nil {
 		return true
 	}
@@ -487,76 +458,6 @@ func emitRecord(ctx context.Context, exportRows chan<- ObjectRecord, record Obje
 	}
 }
 
-func startAvroExport(avroDir string, workers, batch int) (*avroExport, error) {
-	if avroDir == "" {
-		return nil, nil
-	}
-	tmpDir := filepath.Join(avroDir, "tmp")
-	incomingDir := filepath.Join(avroDir, "incoming")
-	processingDir := filepath.Join(avroDir, "processing")
-	doneDir := filepath.Join(avroDir, "done")
-	errorDir := filepath.Join(avroDir, "error")
-	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
-		return nil, fmt.Errorf("could not create avro tmp directory %q: %w", tmpDir, err)
-	}
-	if err := os.MkdirAll(incomingDir, 0o755); err != nil {
-		return nil, fmt.Errorf("could not create avro incoming directory %q: %w", incomingDir, err)
-	}
-	if err := os.MkdirAll(processingDir, 0o755); err != nil {
-		return nil, fmt.Errorf("could not create avro processing directory %q: %w", processingDir, err)
-	}
-	if err := os.MkdirAll(doneDir, 0o755); err != nil {
-		return nil, fmt.Errorf("could not create avro done directory %q: %w", doneDir, err)
-	}
-	if err := os.MkdirAll(errorDir, 0o755); err != nil {
-		return nil, fmt.Errorf("could not create avro error directory %q: %w", errorDir, err)
-	}
-
-	baseName := fmt.Sprintf("scan-%s", time.Now().Format("20060102-150405"))
-	pathPattern := filepath.Join(incomingDir, baseName+"-*.avro")
-
-	exporter := &avroExport{
-		path: pathPattern,
-		rows: make(chan ObjectRecord, exportBufferSize(workers, batch)),
-		errc: make(chan error, 1),
-	}
-	go func() {
-		exporter.errc <- writeAvroFiles(tmpDir, incomingDir, baseName, exporter.rows)
-	}()
-	return exporter, nil
-}
-
-func (e *avroExport) wait() error {
-	if e == nil {
-		return nil
-	}
-	return <-e.errc
-}
-
-func writeDoneFile(avroDir string) error {
-	if avroDir == "" {
-		return nil
-	}
-
-	donePath := filepath.Join(avroDir, "incoming", ".done")
-	f, err := os.Create(donePath)
-	if err != nil {
-		return fmt.Errorf("could not create done file %q: %w", donePath, err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("could not close done file %q: %w", donePath, err)
-	}
-	return nil
-}
-
-func exportBufferSize(workers, batch int) int {
-	bufferSize := workers * batch
-	if bufferSize < 1024 {
-		bufferSize = 1024
-	}
-	return bufferSize
-}
-
 func exportRelativePath(root, path string) string {
 	relativePath, err := filepath.Rel(root, path)
 	if err != nil {
@@ -565,7 +466,7 @@ func exportRelativePath(root, path string) string {
 	return filepath.ToSlash(relativePath)
 }
 
-func fillRecordFromInfo(record *ObjectRecord, info os.FileInfo) {
+func fillRecordFromInfo(record *avro.Record, info os.FileInfo) {
 	record.Type = entryTypeFromMode(info.Mode())
 	record.Size = info.Size()
 	record.MTimeUnixNs = info.ModTime().UnixNano()
@@ -573,24 +474,24 @@ func fillRecordFromInfo(record *ObjectRecord, info os.FileInfo) {
 	record.Mode = int64(info.Mode())
 }
 
-func entryTypeFromMode(mode os.FileMode) EntryType {
+func entryTypeFromMode(mode os.FileMode) avro.EntryType {
 	switch {
 	case mode.IsRegular():
-		return TypeFile
+		return avro.TypeFile
 	case mode.IsDir():
-		return TypeDir
+		return avro.TypeDir
 	case mode&os.ModeSymlink != 0:
-		return TypeSymlink
+		return avro.TypeSymlink
 	case mode&os.ModeSocket != 0:
-		return TypeSocket
+		return avro.TypeSocket
 	case mode&os.ModeNamedPipe != 0:
-		return TypePipe
+		return avro.TypePipe
 	case mode&os.ModeDevice != 0 && mode&os.ModeCharDevice != 0:
-		return TypeCharDev
+		return avro.TypeCharDev
 	case mode&os.ModeDevice != 0:
-		return TypeDevice
+		return avro.TypeDevice
 	default:
-		return TypeUnknown
+		return avro.TypeUnknown
 	}
 }
 
@@ -601,157 +502,6 @@ func ctimeUnixNs(info os.FileInfo) int64 {
 	}
 	return stat.Ctim.Sec*1_000_000_000 + stat.Ctim.Nsec
 }
-
-func writeAvroFiles(tmpDir, incomingDir, baseName string, rows <-chan ObjectRecord) (err error) {
-	var (
-		f                   *os.File
-		writer              *goavro.OCFWriter
-		fileIndex           int
-		recordsInFile       int
-		currentTmpPath      string
-		currentIncomingPath string
-	)
-
-	closeCurrent := func() error {
-		if f == nil {
-			return nil
-		}
-		closeErr := f.Close()
-		name := f.Name()
-		f = nil
-		writer = nil
-		if closeErr != nil {
-			return fmt.Errorf("could not close avro file %q: %w", name, closeErr)
-		}
-		return nil
-	}
-
-	publishCurrent := func() error {
-		if f == nil {
-			return nil
-		}
-		if err := closeCurrent(); err != nil {
-			return err
-		}
-		if err := os.Rename(currentTmpPath, currentIncomingPath); err != nil {
-			return fmt.Errorf("could not move avro file %q to %q: %w", currentTmpPath, currentIncomingPath, err)
-		}
-		currentTmpPath = ""
-		currentIncomingPath = ""
-		recordsInFile = 0
-		return nil
-	}
-
-	defer func() {
-		if closeErr := closeCurrent(); closeErr != nil {
-			if err == nil {
-				err = closeErr
-			} else {
-				err = errors.Join(err, closeErr)
-			}
-		}
-	}()
-
-	openNext := func() error {
-		if err := closeCurrent(); err != nil {
-			return err
-		}
-		fileIndex++
-		recordsInFile = 0
-		currentTmpPath = filepath.Join(tmpDir, fmt.Sprintf("%s-%06d.avro", baseName, fileIndex))
-		currentIncomingPath = filepath.Join(incomingDir, fmt.Sprintf("%s-%06d.avro", baseName, fileIndex))
-		nextFile, err := os.Create(currentTmpPath)
-		if err != nil {
-			return fmt.Errorf("could not create avro file %q: %w", currentTmpPath, err)
-		}
-		nextWriter, err := goavro.NewOCFWriter(goavro.OCFConfig{
-			W:               nextFile,
-			Schema:          avroObjectRecordSchema,
-			CompressionName: "deflate",
-		})
-		if err != nil {
-			closeErr := nextFile.Close()
-			if closeErr != nil {
-				return errors.Join(
-					fmt.Errorf("could not initialize avro writer %q: %w", currentTmpPath, err),
-					fmt.Errorf("could not close avro file %q: %w", currentTmpPath, closeErr),
-				)
-			}
-			return fmt.Errorf("could not initialize avro writer %q: %w", currentTmpPath, err)
-		}
-		f = nextFile
-		writer = nextWriter
-		return nil
-	}
-
-	batch := make([]interface{}, 0, 1024)
-	flush := func() error {
-		pending := batch
-		for len(pending) > 0 {
-			if writer == nil {
-				if err := openNext(); err != nil {
-					return err
-				}
-			}
-
-			remaining := avroMaxRecordsPerFile - recordsInFile
-			if remaining <= 0 {
-				if err := publishCurrent(); err != nil {
-					return err
-				}
-				if err := openNext(); err != nil {
-					return err
-				}
-				remaining = avroMaxRecordsPerFile
-			}
-			if remaining > len(pending) {
-				remaining = len(pending)
-			}
-
-			if err := writer.Append(pending[:remaining]); err != nil {
-				return fmt.Errorf("could not write avro rows to %q: %w", f.Name(), err)
-			}
-			recordsInFile += remaining
-			pending = pending[remaining:]
-		}
-		batch = batch[:0]
-		return nil
-	}
-
-	for row := range rows {
-		batch = append(batch, map[string]interface{}{
-			"path":          row.Path,
-			"entry_type":    int32(row.Type),
-			"size":          row.Size,
-			"mtime_unix_ns": row.MTimeUnixNs,
-			"ctime_unix_ns": row.CTimeUnixNs,
-			"mode":          row.Mode,
-		})
-		if len(batch) == cap(batch) {
-			if err := flush(); err != nil {
-				return err
-			}
-		}
-	}
-
-	if err := flush(); err != nil {
-		return err
-	}
-	return publishCurrent()
-}
-
-const avroObjectRecordSchema = `{
-  "type": "record",
-  "name": "ObjectRecord",
-  "fields": [
-    {"name": "path", "type": "string"},
-    {"name": "entry_type", "type": "int"},
-    {"name": "size", "type": "long"},
-    {"name": "mtime_unix_ns", "type": "long"},
-    {"name": "ctime_unix_ns", "type": "long"},
-    {"name": "mode", "type": "long"}
-  ]
-}`
 
 func humanSI(n int64) string {
 	switch {
