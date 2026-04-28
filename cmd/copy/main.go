@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -28,6 +29,9 @@ type CopyContext struct {
 	DestinationDir string
 	AvroDir        string
 	Workers        int
+	Verbosity      int
+	LogFile        string
+	DecisionLog    *decisionLogger
 }
 
 type DirectoryMetadata struct {
@@ -74,6 +78,12 @@ type profiler struct {
 	printer   *stderrPrinter
 	cpuFile   *os.File
 	traceFile *os.File
+}
+
+type decisionLogger struct {
+	mu     sync.Mutex
+	file   *os.File
+	writer *bufio.Writer
 }
 
 type stderrPrinter struct {
@@ -202,6 +212,8 @@ func main() {
 	var (
 		avroDir          string
 		workers          int
+		verbosity        int
+		logFile          string
 		cpuProfile       string
 		memProfile       string
 		blockProfile     string
@@ -236,12 +248,17 @@ This is only a skeleton for now and the actual copy logic will be added later.`,
 			if err := validateAvroDir(avroDir); err != nil {
 				return err
 			}
+			if verbosity >= 2 && logFile == "" {
+				return fmt.Errorf("--log-file is required with -vv")
+			}
 
 			return run(CopyContext{
 				SourceDir:      sourceDir,
 				DestinationDir: destinationDir,
 				AvroDir:        avroDir,
 				Workers:        workers,
+				Verbosity:      verbosity,
+				LogFile:        logFile,
 			}, ProfileConfig{
 				CPUProfile:       cpuProfile,
 				MemProfile:       memProfile,
@@ -254,6 +271,8 @@ This is only a skeleton for now and the actual copy logic will be added later.`,
 	}
 
 	rootCmd.Flags().IntVarP(&workers, "jobs", "j", 4, "Number of parallel workers")
+	rootCmd.Flags().CountVarP(&verbosity, "verbose", "v", "Increase verbosity (-vv enables per-object decision logging)")
+	rootCmd.Flags().StringVar(&logFile, "log-file", "", "Write -vv decision logs to this file")
 	rootCmd.Flags().StringVarP(&cpuProfile, "cpuprofile", "p", "", "Write CPU profile to this file")
 	rootCmd.Flags().StringVar(&memProfile, "memprofile", "", "Write heap profile to this file")
 	rootCmd.Flags().StringVar(&blockProfile, "blockprofile", "", "Write blocking profile to this file")
@@ -286,6 +305,19 @@ func run(ctx CopyContext, profileCfg ProfileConfig) (err error) {
 			err = stopErr
 		}
 	}()
+
+	if ctx.Verbosity >= 2 {
+		logger, logErr := newDecisionLogger(ctx.LogFile)
+		if logErr != nil {
+			return logErr
+		}
+		ctx.DecisionLog = logger
+		defer func() {
+			if closeErr := logger.Close(); closeErr != nil && err == nil {
+				err = closeErr
+			}
+		}()
+	}
 
 	if ctx.AvroDir != "" {
 		return processIncomingAvroFiles(runCtx, ctx)
@@ -514,6 +546,65 @@ func startProfiler(cfg ProfileConfig, printer *stderrPrinter) (*profiler, error)
 	return p, nil
 }
 
+func newDecisionLogger(path string) (*decisionLogger, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, fmt.Errorf("could not create decision log %q: %w", path, err)
+	}
+	return &decisionLogger{
+		file:   f,
+		writer: bufio.NewWriter(f),
+	}, nil
+}
+
+func (l *decisionLogger) Log(itemized, path string, isDir bool) error {
+	if l == nil {
+		return nil
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if isDir && path != "" && path[len(path)-1] != '/' {
+		path += "/"
+	}
+	if _, err := fmt.Fprintf(l.writer, "%s %s\n", itemized, path); err != nil {
+		return fmt.Errorf("could not write decision log: %w", err)
+	}
+	return nil
+}
+
+func (l *decisionLogger) Close() error {
+	if l == nil {
+		return nil
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var errs []error
+	if l.writer != nil {
+		if err := l.writer.Flush(); err != nil {
+			errs = append(errs, fmt.Errorf("could not flush decision log %q: %w", l.file.Name(), err))
+		}
+		l.writer = nil
+	}
+	if l.file != nil {
+		if err := l.file.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("could not close decision log %q: %w", l.file.Name(), err))
+		}
+		l.file = nil
+	}
+	return errors.Join(errs...)
+}
+
+func (ctx CopyContext) logDecision(itemized, path string, isDir bool) error {
+	if ctx.DecisionLog == nil {
+		return nil
+	}
+	return ctx.DecisionLog.Log(itemized, path, isDir)
+}
+
 func (p *profiler) Stop() error {
 	if p == nil {
 		return nil
@@ -678,10 +769,24 @@ func processDirectoryRecord(ctx CopyContext, state *workerState, record avro.Rec
 			if stats != nil {
 				atomic.AddInt64(&stats.TotalDirs, 1)
 			}
-			return nil
+			return ctx.logDecision(".d.........", record.Path, true)
 		}
 	case os.IsNotExist(err):
-		// handled below
+		if err := ensureParentDirectory(state, destinationPath); err != nil {
+			return err
+		}
+		if err := os.Mkdir(destinationPath, metadata.Mode.Perm()); err != nil {
+			if !os.IsExist(err) {
+				return fmt.Errorf("could not create destination directory %q: %w", destinationPath, err)
+			}
+		}
+		if err := applyDirectoryMetadata(destinationPath, metadata); err != nil {
+			return err
+		}
+		if stats != nil {
+			atomic.AddInt64(&stats.TotalDirs, 1)
+		}
+		return ctx.logDecision(">d+++++++++", record.Path, true)
 	default:
 		return fmt.Errorf("could not stat destination directory %q: %w", destinationPath, err)
 	}
@@ -703,7 +808,7 @@ func processDirectoryRecord(ctx CopyContext, state *workerState, record avro.Rec
 	if stats != nil {
 		atomic.AddInt64(&stats.TotalDirs, 1)
 	}
-	return nil
+	return ctx.logDecision(">d...pogua.", record.Path, true)
 }
 
 func ensureParentDirectory(state *workerState, destinationPath string) error {
@@ -748,7 +853,7 @@ func processFileRecord(ctx CopyContext, state *workerState, record avro.Record, 
 			atomic.AddInt64(&stats.TotalFiles, 1)
 			atomic.AddInt64(&stats.TotalBytes, record.Size)
 		}
-		return nil
+		return ctx.logDecision(">f+++++++++", record.Path, false)
 	default:
 		if err != nil {
 			return fmt.Errorf("could not stat destination file %q: %w", destinationPath, err)
@@ -772,7 +877,7 @@ func processFileRecord(ctx CopyContext, state *workerState, record avro.Record, 
 			atomic.AddInt64(&stats.TotalFiles, 1)
 			atomic.AddInt64(&stats.TotalBytes, record.Size)
 		}
-		return nil
+		return ctx.logDecision(fileChangeCode(sameSize, sameMTime), record.Path, false)
 	}
 
 	destinationCTime, err := ctimeUnixNs(destinationInfo)
@@ -784,7 +889,7 @@ func processFileRecord(ctx CopyContext, state *workerState, record avro.Record, 
 			atomic.AddInt64(&stats.TotalFiles, 1)
 			atomic.AddInt64(&stats.TotalBytes, record.Size)
 		}
-		return nil
+		return ctx.logDecision(".f.........", record.Path, false)
 	}
 
 	metadata, err := readSourceFileMetadata(sourcePath, record)
@@ -798,7 +903,7 @@ func processFileRecord(ctx CopyContext, state *workerState, record avro.Record, 
 		atomic.AddInt64(&stats.TotalFiles, 1)
 		atomic.AddInt64(&stats.TotalBytes, record.Size)
 	}
-	return nil
+	return ctx.logDecision(">f...pogua.", record.Path, false)
 }
 
 func processOtherRecord(ctx CopyContext, record avro.Record, stats *AvroStats) error {
@@ -818,6 +923,19 @@ func processOtherRecord(ctx CopyContext, record avro.Record, stats *AvroStats) e
 		return nil
 	default:
 		return fmt.Errorf("could not stat destination path %q: %w", destinationPath, err)
+	}
+}
+
+func fileChangeCode(sameSize, sameMTime bool) string {
+	switch {
+	case !sameSize && !sameMTime:
+		return ">f.st......"
+	case !sameSize:
+		return ">f.s......."
+	case !sameMTime:
+		return ">f..t......"
+	default:
+		return ".f........."
 	}
 }
 
