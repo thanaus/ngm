@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/pprof"
 	"sync"
@@ -34,6 +35,11 @@ type ScanResult struct {
 	ScanNs    int64
 	ReadDirNs int64
 	InfoNs    int64
+}
+
+type pathMatcher struct {
+	includes []*regexp.Regexp
+	excludes []*regexp.Regexp
 }
 
 type dirQueue struct {
@@ -132,12 +138,13 @@ func (q *dirQueue) done() {
 
 func main() {
 	var (
-		workers    int
-		noSize     bool
-		batch      int
-		cpuProfile string
-		memProfile string
-		avroDir    string
+		workers         int
+		noSize          bool
+		batch           int
+		cpuProfile      string
+		memProfile      string
+		avroDir         string
+		excludePatterns []string
 	)
 
 	rootCmd := &cobra.Command{
@@ -154,14 +161,19 @@ and reports the number of files, directories, total size, and performance metric
 			if batch < 1 {
 				return fmt.Errorf("--batch must be >= 1")
 			}
+			matcher, err := newPathMatcher(nil, excludePatterns)
+			if err != nil {
+				return err
+			}
 			root := filepath.Clean(args[0])
-			return run(root, workers, noSize, batch, cpuProfile, memProfile, avroDir)
+			return run(root, workers, noSize, batch, cpuProfile, memProfile, avroDir, matcher)
 		},
 	}
 
 	rootCmd.Flags().IntVarP(&workers, "jobs", "j", 4, "Number of parallel workers")
 	rootCmd.Flags().BoolVarP(&noSize, "no-size", "s", false, "Skip file size collection (avoids one lstat per file)")
 	rootCmd.Flags().IntVarP(&batch, "batch", "b", 256, "Number of entries read per ReadDir syscall (getdents64 batch size)")
+	rootCmd.Flags().StringArrayVar(&excludePatterns, "exclude", nil, "Exclude relative paths matching this regular expression (repeatable; Go regexp syntax)")
 	rootCmd.Flags().StringVarP(&cpuProfile, "cpuprofile", "p", "", "Write CPU profile to this file (analyse with: go tool pprof -top <file>)")
 	rootCmd.Flags().StringVar(&memProfile, "memprofile", "", "Write heap profile to this file (analyse with: go tool pprof -top <binary> <file>)")
 	rootCmd.Flags().StringVar(&avroDir, "avro-dir", "", "Write scanned objects to an avro file in this directory")
@@ -171,7 +183,7 @@ and reports the number of files, directories, total size, and performance metric
 	}
 }
 
-func run(root string, workers int, noSize bool, batch int, cpuProfile, memProfile, avroDir string) error {
+func run(root string, workers int, noSize bool, batch int, cpuProfile, memProfile, avroDir string, matcher *pathMatcher) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 	printer := &stderrPrinter{}
@@ -222,7 +234,7 @@ func run(root string, workers int, noSize bool, batch int, cpuProfile, memProfil
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runWorker(ctx, q, printer, root, &result, noSize, batch, exportRows)
+			runWorker(ctx, q, printer, root, &result, noSize, batch, exportRows, matcher)
 		}()
 	}
 
@@ -346,7 +358,7 @@ func reportProgress(ctx context.Context, printer *stderrPrinter, result *ScanRes
 	}
 }
 
-func runWorker(ctx context.Context, q *dirQueue, printer *stderrPrinter, root string, result *ScanResult, noSize bool, batch int, exportRows chan<- avro.Record) {
+func runWorker(ctx context.Context, q *dirQueue, printer *stderrPrinter, root string, result *ScanResult, noSize bool, batch int, exportRows chan<- avro.Record, matcher *pathMatcher) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -361,7 +373,7 @@ func runWorker(ctx context.Context, q *dirQueue, printer *stderrPrinter, root st
 		}
 
 		t1 := time.Now()
-		subdirs := scanDir(ctx, printer, root, dir, result, noSize, batch, exportRows)
+		subdirs := scanDir(ctx, printer, root, dir, result, noSize, batch, exportRows, matcher)
 		atomic.AddInt64(&result.ScanNs, int64(time.Since(t1)))
 
 		q.push(subdirs)
@@ -369,7 +381,7 @@ func runWorker(ctx context.Context, q *dirQueue, printer *stderrPrinter, root st
 	}
 }
 
-func scanDir(ctx context.Context, printer *stderrPrinter, root, dir string, result *ScanResult, noSize bool, batch int, exportRows chan<- avro.Record) []string {
+func scanDir(ctx context.Context, printer *stderrPrinter, root, dir string, result *ScanResult, noSize bool, batch int, exportRows chan<- avro.Record, matcher *pathMatcher) []string {
 	f, err := os.Open(dir)
 	if err != nil {
 		printer.Logf("[error] open %q: %v", dir, err)
@@ -393,6 +405,9 @@ func scanDir(ctx context.Context, printer *stderrPrinter, root, dir string, resu
 		for _, entry := range entries {
 			path := prefix + entry.Name()
 			relativePath := exportRelativePath(root, path)
+			if matcher != nil && !matcher.allow(relativePath, entry.IsDir()) {
+				continue
+			}
 			t := time.Now()
 			info, infoErr := entry.Info()
 			atomic.AddInt64(&result.InfoNs, int64(time.Since(t)))
@@ -444,6 +459,55 @@ func scanDir(ctx context.Context, printer *stderrPrinter, root, dir string, resu
 	}
 
 	return subdirs
+}
+
+func newPathMatcher(includePatterns, excludePatterns []string) (*pathMatcher, error) {
+	includes, err := compilePatterns("include", includePatterns)
+	if err != nil {
+		return nil, err
+	}
+	excludes, err := compilePatterns("exclude", excludePatterns)
+	if err != nil {
+		return nil, err
+	}
+	return &pathMatcher{
+		includes: includes,
+		excludes: excludes,
+	}, nil
+}
+
+func compilePatterns(kind string, patterns []string) ([]*regexp.Regexp, error) {
+	compiled := make([]*regexp.Regexp, 0, len(patterns))
+	for _, pattern := range patterns {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s regexp %q: %w", kind, pattern, err)
+		}
+		compiled = append(compiled, re)
+	}
+	return compiled, nil
+}
+
+func (m *pathMatcher) allow(path string, isDir bool) bool {
+	if m == nil {
+		return true
+	}
+	if len(m.includes) > 0 && !matchesAnyPattern(m.includes, path, isDir) {
+		return false
+	}
+	return !matchesAnyPattern(m.excludes, path, isDir)
+}
+
+func matchesAnyPattern(patterns []*regexp.Regexp, path string, isDir bool) bool {
+	for _, pattern := range patterns {
+		if pattern.MatchString(path) {
+			return true
+		}
+		if isDir && pattern.MatchString(path+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func emitRecord(ctx context.Context, exportRows chan<- avro.Record, record avro.Record) bool {
